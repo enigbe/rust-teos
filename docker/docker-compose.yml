@@ -1,0 +1,83 @@
+services:
+  bitcoin:
+    image: blockstream/bitcoind:31.1
+    command:
+      - bitcoind
+      - -printtoconsole
+      - -regtest=1
+      - -datadir=/data
+      - -server=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=user
+      - -rpcpassword=pass
+      - -fallbackfee=0.00001
+    ports:
+      - "127.0.0.1:18443:18443"
+      - "127.0.0.1:18444:18444"
+    volumes:
+      - bitcoin-data:/data
+    networks:
+      - teos
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-datadir=/data", "-regtest", "-rpcuser=user", "-rpcpassword=pass", "getblockchaininfo"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # teosd refuses to start until the chain has at least 100 blocks, so mine
+  # whatever is missing to reach height 101 before starting it.
+  bitcoin-init:
+    image: blockstream/bitcoind:31.1
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cli="bitcoin-cli -regtest -rpcconnect=bitcoin -rpcuser=user -rpcpassword=pass"
+        missing=$$((101 - $$($$cli getblockcount)))
+        if [ "$$missing" -gt 0 ]; then
+          $$cli generatetodescriptor "$$missing" "raw(51)" > /dev/null
+        fi
+        echo "chain height: $$($$cli getblockcount)"
+    networks:
+      - teos
+
+  teosd:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    platform: linux/amd64
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+      bitcoin-init:
+        condition: service_completed_successfully
+    environment:
+      BTC_NETWORK: regtest
+      BTC_RPC_CONNECT: bitcoin
+      BTC_RPC_PORT: "18443"
+      BTC_RPC_USER: user
+      BTC_RPC_PASSWORD: pass
+      API_BIND: 0.0.0.0
+      API_PORT: "9814"
+      RPC_BIND: 0.0.0.0
+      RPC_PORT: "8814"
+    ports:
+      - "127.0.0.1:9814:9814"
+      - "127.0.0.1:8814:8814"
+    volumes:
+      - teos-data:/home/teos/.teos
+    networks:
+      - teos
+    restart: unless-stopped
+
+networks:
+  teos:
+    driver: bridge
+
+volumes:
+  bitcoin-data:
+  teos-data:

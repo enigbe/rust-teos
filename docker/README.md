@@ -83,6 +83,30 @@ docker run \
 Notice that we also needed to add `API_BIND=0.0.0.0` and `RPC_BIND=0.0.0.0` to bind the API to all interfaces of the container.
 Otherwise it will bind to `localhost` and we won't be able to send requests to the tower from the host.
 
+### Running `teosd` and a regtest `bitcoind` with Docker Compose
+
+For local development and testing, `docker/docker-compose.yml` starts a regtest `bitcoind` together with a `teosd` built from the local source:
+
+    cd rust-teos
+    docker compose -f docker/docker-compose.yml up -d --build
+
+`teosd` needs at least 100 blocks to start, so a one-shot `bitcoin-init` service mines the chain up to height 101 before `teosd` is started. Restarting the stack with existing volumes does not mine extra blocks.
+
+The following ports are published on `localhost` only:
+
+```
+- 9814: teosd API
+- 8814: teosd RPC
+- 18443: bitcoind RPC (user: user, password: pass)
+- 18444: bitcoind P2P
+```
+
+You can run `teos-cli` inside the `teosd` container:
+
+    docker compose -f docker/docker-compose.yml exec teosd teos-cli gettowerinfo
+
+To stop the stack, run `docker compose -f docker/docker-compose.yml down`. Add `-v` to also delete the chain and tower data volumes.
+
 ### Interacting with a TEOS instance
 
 Once our `teos` instance is running in the container, we can interact with it using `teos-cli`. We have two main ways of doing so:
