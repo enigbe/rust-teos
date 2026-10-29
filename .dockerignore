@@ -1,0 +1,10 @@
+# Local Rust build artifacts; the image builds its own binaries.
+target/
+**/target/
+
+# Repository metadata and local tooling.
+.git/
+.vscode/
+.idea/
+**/__pycache__/
+result

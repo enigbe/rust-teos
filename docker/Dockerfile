@@ -6,7 +6,7 @@ COPY . /tmp/rust-teos
 
 # Install the dependencies required for building rust-teos
 RUN apt-get update\
-    && apt-get -y --no-install-recommends install libffi-dev libssl-dev musl-tools pkg-config
+    && apt-get -y --no-install-recommends install libffi-dev libssl-dev musl-tools pkg-config protobuf-compiler libprotobuf-dev
 
 RUN cd /tmp/rust-teos \
     && rustup target add x86_64-unknown-linux-musl \
