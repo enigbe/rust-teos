@@ -64,7 +64,7 @@
               ./Cargo.lock
               ./teos-common
               ./teos
-              ./watchtower-plugin
+              ./clients/watchtower-plugin
               crate
             ];
           };
@@ -74,8 +74,8 @@
           // {
             pname = "watchtower-plugin";
             cargoExtraArgs = "-p watchtower-plugin";
-            src = fileSetForCrate ./watchtower-plugin;
-            inherit (craneLib.crateNameFromCargoToml { cargoToml = ./watchtower-plugin/Cargo.toml; }) version;
+            src = fileSetForCrate ./clients/watchtower-plugin;
+            inherit (craneLib.crateNameFromCargoToml { cargoToml = ./clients/watchtower-plugin/Cargo.toml; }) version;
           }
         );
         teos = craneLib.buildPackage (

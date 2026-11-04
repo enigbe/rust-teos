@@ -65,7 +65,7 @@ jobs:
       - name: Run black
         uses: psf/black@stable
         with:
-          src: "./watchtower-plugin/tests"
+          src: "./clients/watchtower-plugin/tests"
           options: "--check -l 120"
 
   check-flake:

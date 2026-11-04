@@ -121,7 +121,7 @@ The files are generated to the data directory (by default stored at `~/.teos/`).
 
 Here is a list of the available clients for `teos`:
 
-- [watchtower-client for CLN](watchtower-plugin/)
+- [watchtower-client for CLN](clients/watchtower-plugin/)
 
 ## Contributing 
 Refer to [CONTRIBUTING.md](CONTRIBUTING.md)

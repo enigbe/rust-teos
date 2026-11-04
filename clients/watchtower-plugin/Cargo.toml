@@ -29,7 +29,7 @@ bitcoin = "0.32.0"
 cln-plugin = "0.3.0"
 
 # Local
-teos-common = { path = "../teos-common" }
+teos-common = { path = "../../teos-common" }
 
 [dev-dependencies]
 mockito = "0.32.4"
