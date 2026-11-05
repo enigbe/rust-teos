@@ -1,0 +1,7 @@
+[package]
+name = "ldk-watchtower-client"
+version = "0.2.0"
+authors = ["Enigbe Ochekliye <ochekliyeenigbe@gmail.com>"]
+description = "An LDK watchtower client for The Eye of Satoshi"
+license = "MIT"
+edition = "2021"
