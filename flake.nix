@@ -65,6 +65,7 @@
               ./teos-common
               ./teos
               ./clients/watchtower-plugin
+              ./clients/ldk
               crate
             ];
           };
