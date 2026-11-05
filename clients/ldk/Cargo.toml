@@ -10,3 +10,4 @@ edition = "2021"
 # Pin the published FreeOnlineUser/watchtower-justice-api revision.
 lightning = { git = "https://git.rust-bitcoin.org/lightningdevkit/rust-lightning.git", rev = "f17591b71e8f9c4fe6ce6783513328d060c97e1e", default-features = false, features = ["std"] }
 teos-common = { path = "../../teos-common" }
+url = "2.5.4"
