@@ -1,7 +1,7 @@
 //! An embedded watchtower client for LDK-based Lightning nodes using The Eye of Satoshi.
 //!
 //! This crate provides tower connection configuration, persistent client identity,
-//! and a bridge from LDK justice transaction types to TEOS locators.
+//! explicit tower registration, and a bridge from LDK justice types to TEOS locators.
 //! The initial implementation is planned to protect revoked counterparty commitment
 //! `to_local` outputs; HTLC outputs are outside its initial scope.
 
@@ -11,10 +11,12 @@ use teos_common::appointment::Locator;
 mod config;
 mod dbm;
 mod identity;
+mod registration;
 
 pub use config::{TowerConfig, TowerConfigError};
 pub use dbm::{ClientStore, StorageError};
 pub use identity::ClientIdentity;
+pub use registration::{RegistrationError, TowerClient};
 
 /// Derives the TEOS appointment locator for a revoked counterparty commitment.
 ///
