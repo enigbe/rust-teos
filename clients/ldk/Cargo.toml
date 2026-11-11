@@ -11,11 +11,11 @@ edition = "2021"
 lightning = { git = "https://git.rust-bitcoin.org/lightningdevkit/rust-lightning.git", rev = "f17591b71e8f9c4fe6ce6783513328d060c97e1e", default-features = false, features = ["std"] }
 reqwest = { version = "0.11.27", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.26.0", features = ["bundled"] }
+serde_json = "1.0"
 teos-common = { path = "../../teos-common" }
 url = "2.5.4"
 
 [dev-dependencies]
 mockito = "0.32.5"
-serde_json = "1.0"
 tempfile = "3.16.0"
 tokio = { version = "1.5", features = ["macros", "rt"] }

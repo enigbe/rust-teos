@@ -5,7 +5,7 @@ use std::path::Path;
 use lightning::bitcoin::{hashes::Hash, secp256k1::SecretKey, Txid};
 use lightning::ln::types::ChannelId;
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
-use teos_common::receipts::RegistrationReceipt;
+use teos_common::receipts::{AppointmentReceipt, RegistrationReceipt};
 use teos_common::{
     appointment::{Appointment, Locator},
     cryptography,
@@ -39,6 +39,15 @@ CREATE TABLE IF NOT EXISTS pending_appointments (
     to_self_delay INTEGER NOT NULL,
     signature TEXT NOT NULL,
     PRIMARY KEY (channel_id, commitment_txid)
+);
+CREATE TABLE IF NOT EXISTS appointment_receipts (
+    tower_id BLOB NOT NULL,
+    channel_id BLOB NOT NULL,
+    commitment_txid BLOB NOT NULL,
+    user_signature TEXT NOT NULL,
+    start_block INTEGER NOT NULL,
+    tower_signature TEXT NOT NULL,
+    PRIMARY KEY (tower_id, channel_id, commitment_txid, start_block)
 );";
 
 const SELECT_REGISTRATION: &str =
@@ -66,6 +75,17 @@ FROM pending_appointments WHERE channel_id=?1 AND commitment_txid=?2";
 const SELECT_IDENTITY: &str = "SELECT secret_key FROM client_identity WHERE id = 1";
 
 const INSERT_IDENTITY: &str = "INSERT INTO client_identity (id, secret_key) VALUES (1, ?1)";
+
+const UPSERT_APPOINTMENT_RECEIPT: &str = "INSERT INTO appointment_receipts
+    (tower_id, channel_id, commitment_txid, user_signature, start_block, tower_signature)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT (tower_id, channel_id, commitment_txid, start_block) DO UPDATE SET
+    user_signature=excluded.user_signature,
+    tower_signature=excluded.tower_signature";
+
+const SELECT_APPOINTMENT_RECEIPT: &str = "SELECT user_signature, start_block, tower_signature
+FROM appointment_receipts WHERE tower_id=?1 AND channel_id=?2 AND commitment_txid=?3
+ORDER BY start_block DESC LIMIT 1";
 
 /// SQLite storage for the LDK watchtower client.
 ///
@@ -200,6 +220,82 @@ impl PendingAppointmentFailure {
 }
 
 impl ClientStore {
+    /// Loads the latest-starting receipt for this tower and pending job.
+    ///
+    /// Verifies the tower signature and its binding to the saved appointment's
+    /// client signature. Earlier receipts are retained as service evidence.
+    // TODO: Before pending-job cleanup, preserve the appointment association
+    // needed to load and verify receipts after their source jobs are removed.
+    pub fn appointment_receipt(
+        &self,
+        tower_id: TowerId,
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+    ) -> Result<Option<AppointmentReceipt>, StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let receipt = transaction
+            .query_row(
+                SELECT_APPOINTMENT_RECEIPT,
+                params![
+                    tower_id.to_vec(),
+                    &channel_id.0[..],
+                    &commitment_txid.to_byte_array()[..]
+                ],
+                |row| {
+                    Ok(AppointmentReceipt::with_signature(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(receipt) = &receipt {
+            let job = find_pending(&transaction, channel_id, commitment_txid)?
+                .ok_or(StorageError::InvalidAppointmentReceipt)?;
+            if receipt.user_signature() != job.signature() || !receipt.verify(&tower_id) {
+                return Err(StorageError::InvalidAppointmentReceipt);
+            }
+        }
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn store_appointment_receipt(
+        &mut self,
+        tower_id: TowerId,
+        job: &PendingAppointment,
+        receipt: &AppointmentReceipt,
+    ) -> Result<(), StorageError> {
+        if receipt.user_signature() != job.signature() || !receipt.verify(&tower_id) {
+            return Err(StorageError::InvalidAppointmentReceipt);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Do not record delivery against a job changed or removed during the request.
+        if find_pending(&transaction, job.channel_id(), job.commitment_txid())?.as_ref()
+            != Some(job)
+        {
+            return Err(StorageError::InvalidPendingAppointment);
+        }
+        transaction.execute(
+            UPSERT_APPOINTMENT_RECEIPT,
+            params![
+                tower_id.to_vec(),
+                &job.channel_id().0[..],
+                &job.commitment_txid().to_byte_array()[..],
+                receipt.user_signature(),
+                receipt.start_block(),
+                receipt
+                    .signature()
+                    .ok_or(StorageError::InvalidAppointmentReceipt)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Loads and verifies a saved job for the channel and full commitment ID.
     /// A corrupt job is an error, never treated as absent or replaced automatically.
     pub fn pending_appointment(
@@ -374,6 +470,8 @@ pub enum StorageError {
     InvalidRegistration,
     /// A saved appointment is corrupt or belongs to another signing identity.
     InvalidPendingAppointment,
+    /// A stored tower receipt is invalid or does not match its pending job.
+    InvalidAppointmentReceipt,
 }
 
 impl From<rusqlite::Error> for StorageError {
@@ -389,6 +487,7 @@ impl fmt::Display for StorageError {
             Self::InvalidIdentity => write!(f, "Stored client signing key is invalid"),
             Self::InvalidRegistration => write!(f, "Stored tower registration is invalid"),
             Self::InvalidPendingAppointment => write!(f, "Stored pending appointment is invalid"),
+            Self::InvalidAppointmentReceipt => write!(f, "Stored appointment receipt is invalid"),
         }
     }
 }
@@ -397,9 +496,10 @@ impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
-            Self::InvalidIdentity | Self::InvalidRegistration | Self::InvalidPendingAppointment => {
-                None
-            }
+            Self::InvalidIdentity
+            | Self::InvalidRegistration
+            | Self::InvalidPendingAppointment
+            | Self::InvalidAppointmentReceipt => None,
         }
     }
 }

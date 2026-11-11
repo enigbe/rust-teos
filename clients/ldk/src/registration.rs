@@ -7,12 +7,16 @@ use teos_common::receipts::RegistrationReceipt;
 
 use crate::{ClientStore, StorageError, TowerConfig};
 
+// TODO: Share bounded response reading and rejection parsing with submission in a
+// follow-up, preserving registration error codes and separating malformed replies
+// from transport failures. Registration must keep its explicit no-retry behavior.
+
 /// An HTTP client for a single TEOS tower.
 ///
 /// Constructing this does not contact the tower. Requests require a Tokio runtime.
 pub struct TowerClient {
-    config: TowerConfig,
-    http: Client,
+    pub(crate) config: TowerConfig,
+    pub(crate) http: Client,
 }
 
 impl TowerClient {
@@ -23,6 +27,19 @@ impl TowerClient {
             .redirect(Policy::none())
             .build()?;
         Ok(Self { config, http })
+    }
+
+    pub(crate) fn endpoint(&self, method: &str) -> url::Url {
+        let mut endpoint = self.config.endpoint().clone();
+        // Preserve an optional reverse-proxy path prefix.
+        endpoint.set_path(&format!(
+            "{}/{}",
+            endpoint.path().trim_end_matches('/'),
+            method
+        ));
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        endpoint
     }
 
     /// Explicitly registers or tops up the persisted identity with the tower.
@@ -37,18 +54,10 @@ impl TowerClient {
     ) -> Result<RegistrationReceipt, RegistrationError> {
         let identity = store.load_or_create_identity()?;
         let user_id = identity.user_id();
-        let mut endpoint = self.config.endpoint().clone();
-        // Preserve an optional reverse-proxy path prefix.
-        endpoint.set_path(&format!(
-            "{}/register",
-            endpoint.path().trim_end_matches('/')
-        ));
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
 
         let response = self
             .http
-            .post(endpoint)
+            .post(self.endpoint("register"))
             .json(&RegisterRequest {
                 user_id: user_id.to_vec(),
             })
