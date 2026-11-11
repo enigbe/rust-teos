@@ -2,25 +2,28 @@
 //!
 //! This crate provides tower connection configuration, persistent client identity,
 //! explicit tower registration, claim classification with unclassified-claim diagnostics,
-//! and a bridge from LDK justice types to TEOS locators.
-//! The initial implementation is planned to protect revoked counterparty commitment
-//! `to_local` outputs; HTLC outputs are outside its initial scope.
+//! durable preparation of signed appointments, and TEOS locator derivation.
+//! Prepared appointments cover revoked counterparty commitment
+//! `to_local` outputs. Preparation does not submit to a tower or acknowledge LDK
+//! delivery; HTLC outputs remain outside its scope.
 
 use lightning::chain::channelmonitor::JusticeTransactions;
 use teos_common::appointment::Locator;
 
+mod appointments;
 mod claims;
 mod config;
 mod dbm;
 mod identity;
 mod registration;
 
+pub use appointments::{AppointmentPreparation, PendingAppointment, PreparationError};
 pub use claims::{
     classify_claims, ClaimClassification, ClaimClassificationError, ToLocalClaim,
     UnclassifiedClaim, UnclassifiedClaimReason,
 };
 pub use config::{TowerConfig, TowerConfigError};
-pub use dbm::{ClientStore, StorageError};
+pub use dbm::{ClientStore, PendingAppointmentFailure, PendingAppointmentRecovery, StorageError};
 pub use identity::ClientIdentity;
 pub use registration::{RegistrationError, TowerClient};
 
