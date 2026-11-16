@@ -6,9 +6,10 @@ use reqwest::StatusCode;
 use teos_common::{
     protos::{AddAppointmentRequest, AddAppointmentResponse},
     receipts::AppointmentReceipt,
+    TowerId,
 };
 
-use crate::{ClientStore, StorageError, TowerClient};
+use crate::{ClientStore, PendingAppointment, StorageError, TowerClient};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_REJECTION_MESSAGE_BYTES: usize = 4 * 1024;
@@ -18,8 +19,42 @@ const TRUNCATION_MARKER: &str = " [truncated]";
 // URL and ID: register -> prepare -> submit -> reopen -> verify the saved receipt.
 // Document that it consumes tower resources; keep it separate from the mock tests.
 
+/// A tower receipt verified against the exact submitted job, not yet necessarily saved.
+///
+/// Obtain this from [`TowerClient::send_appointment`], then save it with
+/// [`ClientStore::save_appointment_receipt`]. Retain it if saving fails so the save
+/// can be retried without another tower request. This does not authorize LDK acknowledgment.
+#[derive(Clone, Debug)]
+pub struct VerifiedAppointmentReceipt {
+    tower_id: TowerId,
+    job: PendingAppointment,
+    receipt: AppointmentReceipt,
+}
+
+impl VerifiedAppointmentReceipt {
+    /// Returns the configured tower whose signature was verified.
+    pub fn tower_id(&self) -> TowerId {
+        self.tower_id
+    }
+    /// Returns the exact saved job that was sent to the tower.
+    pub fn job(&self) -> &PendingAppointment {
+        &self.job
+    }
+    /// Returns the verified receipt. Verification alone does not imply persistence.
+    pub fn receipt(&self) -> &AppointmentReceipt {
+        &self.receipt
+    }
+}
+
 impl TowerClient {
     /// Explicitly submits a saved appointment to the configured tower.
+    ///
+    /// This convenience method borrows the store throughout the request. For
+    /// concurrent delivery, load the job, call [`Self::send_appointment`], and
+    /// save the result with [`ClientStore::save_appointment_receipt`] instead.
+    /// If saving fails, this convenience method returns a storage error without
+    /// the verified receipt. Use the split API to retain it and retry saving
+    /// without another tower request.
     ///
     /// Loads and validates the pending job before sending its exact payload. Checks
     /// the response locator and tower signature, then persists the receipt before
@@ -40,11 +75,28 @@ impl TowerClient {
         channel_id: ChannelId,
         commitment_txid: Txid,
     ) -> Result<AppointmentReceipt, SubmissionError> {
-        // TODO: Before concurrent multi-tower delivery, separate loading, sending,
-        // and saving so the mutable store borrow does not span the HTTP await.
         let job = store
             .pending_appointment(channel_id, commitment_txid)?
             .ok_or(SubmissionError::MissingAppointment)?;
+        let delivery = self.send_appointment(&job).await?;
+        store.save_appointment_receipt(&delivery)?;
+        Ok(delivery.receipt)
+    }
+
+    /// Sends a saved job's exact payload and verifies the tower's response without storage access.
+    ///
+    /// First load the job with [`ClientStore::pending_appointment`]. The returned
+    /// receipt is verified but not persisted: explicitly call
+    /// [`ClientStore::save_appointment_receipt`] before treating delivery as durable.
+    /// Multiple sends can run concurrently without borrowing the client store.
+    /// The result retains the original job and configured tower ID for saving.
+    ///
+    /// Uses the same response limits and validation as [`Self::submit_appointment`].
+    /// No automatic retries, pending-job removal, or LDK acknowledgment occur.
+    pub async fn send_appointment(
+        &self,
+        job: &PendingAppointment,
+    ) -> Result<VerifiedAppointmentReceipt, SubmissionError> {
         let response = self
             .http
             .post(self.endpoint("add_appointment"))
@@ -100,8 +152,11 @@ impl TowerClient {
             // valid signatures made by an unexpected key.
             return Err(SubmissionError::InvalidSignature);
         }
-        store.store_appointment_receipt(self.config.tower_id(), &job, &receipt)?;
-        Ok(receipt)
+        Ok(VerifiedAppointmentReceipt {
+            tower_id: self.config.tower_id(),
+            job: job.clone(),
+            receipt,
+        })
     }
 }
 

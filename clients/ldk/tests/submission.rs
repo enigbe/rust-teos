@@ -4,6 +4,7 @@ use ldk_watchtower_client::{
     ClientStore, PendingAppointment, StorageError, SubmissionError, TowerClient, TowerConfig,
 };
 use lightning::bitcoin::secp256k1::SecretKey;
+use lightning::bitcoin::{hashes::Hash, Txid};
 use lightning::ln::types::ChannelId;
 use mockito::{Matcher, Server};
 use rusqlite::Connection;
@@ -808,5 +809,269 @@ async fn body_read_failures_preserve_status_and_transport_error() {
         server.join().unwrap();
         assert!(fixture.saved().is_none());
         fixture.assert_pending();
+    }
+}
+
+#[tokio::test]
+async fn sending_returns_a_verified_receipt_without_persisting_it() {
+    let mut server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let receipt = fixture.receipt(100);
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(fixture.response(&receipt))
+        .expect(1)
+        .create_async()
+        .await;
+    let client = fixture.client(&server.url(), Duration::from_secs(5));
+    let delivery = client.send_appointment(&fixture.job).await.unwrap();
+    assert_eq!(delivery.tower_id(), fixture.tower_id);
+    assert_eq!(delivery.job(), &fixture.job);
+    assert_eq!(delivery.receipt(), &receipt);
+    assert!(fixture.saved().is_none());
+    fixture.store.save_appointment_receipt(&delivery).unwrap();
+    assert_eq!(fixture.saved(), Some(receipt));
+    fixture.assert_pending();
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn receipt_save_can_be_retried_without_another_network_request() {
+    let mut server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let receipt = fixture.receipt(100);
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(fixture.response(&receipt))
+        .expect(1)
+        .create_async()
+        .await;
+    let client = fixture.client(&server.url(), Duration::from_secs(5));
+    let delivery = client.send_appointment(&fixture.job).await.unwrap();
+    let db = Connection::open(fixture.directory.path().join("client.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON appointment_receipts BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    assert!(matches!(
+        fixture.store.save_appointment_receipt(&delivery),
+        Err(StorageError::Sqlite(_))
+    ));
+    assert!(fixture.saved().is_none());
+    db.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+    fixture.store.save_appointment_receipt(&delivery).unwrap();
+    assert_eq!(fixture.saved(), Some(receipt));
+    fixture.assert_pending();
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn saving_rejects_a_job_corrupted_or_removed_after_sending() {
+    for sql in [
+        "DELETE FROM pending_appointments",
+        "UPDATE pending_appointments SET signature='invalid'",
+    ] {
+        let mut server = Server::new_async().await;
+        let mut fixture = Fixture::new();
+        let mock = server
+            .mock("POST", "/add_appointment")
+            .with_status(200)
+            .with_body(fixture.response(&fixture.receipt(100)))
+            .expect(1)
+            .create_async()
+            .await;
+        let client = fixture.client(&server.url(), Duration::from_secs(5));
+        let delivery = client.send_appointment(&fixture.job).await.unwrap();
+        let db = Connection::open(fixture.directory.path().join("client.sqlite")).unwrap();
+        db.execute(sql, []).unwrap();
+        assert!(matches!(
+            fixture.store.save_appointment_receipt(&delivery),
+            Err(StorageError::InvalidPendingAppointment)
+        ));
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM appointment_receipts", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn saving_rejects_a_valid_job_reprepared_after_sending() {
+    let mut server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(fixture.response(&fixture.receipt(100)))
+        .expect(1)
+        .create_async()
+        .await;
+    let client = fixture.client(&server.url(), Duration::from_secs(5));
+    let delivery = client.send_appointment(&fixture.job).await.unwrap();
+    let db = Connection::open(fixture.directory.path().join("client.sqlite")).unwrap();
+    // Simulate replacement solely to test stale-receipt rejection. Deleting and
+    // re-encrypting a different payload with the same commitment-derived key and
+    // fixed nonce is not a safe production cleanup or recovery policy.
+    db.execute("DELETE FROM pending_appointments", []).unwrap();
+    let entry = common::justice(vec![common::to_local_with_fee(
+        fixture.job.commitment_txid(),
+        144,
+        0,
+        2000,
+    )]);
+    let replacement = fixture
+        .store
+        .prepare_appointment(fixture.job.channel_id(), &entry)
+        .unwrap()
+        .pending_appointment()
+        .unwrap()
+        .clone();
+    assert_ne!(replacement.appointment(), fixture.job.appointment());
+    // Loading verifies the replacement, so saving must reach the equality check
+    // rather than fail earlier because the stored job is corrupt.
+    assert_eq!(
+        fixture
+            .store
+            .pending_appointment(fixture.job.channel_id(), fixture.job.commitment_txid())
+            .unwrap(),
+        Some(replacement.clone())
+    );
+    assert!(matches!(
+        fixture.store.save_appointment_receipt(&delivery),
+        Err(StorageError::InvalidPendingAppointment)
+    ));
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM appointment_receipts", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .store
+            .pending_appointment(fixture.job.channel_id(), fixture.job.commitment_txid())
+            .unwrap(),
+        Some(replacement)
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn sends_to_two_towers_concurrently_while_the_store_remains_available() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let mut first_server = Server::new_async().await;
+    let mut second_server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let first_id = fixture.tower_id;
+    let first_receipt = fixture.receipt(100);
+    let first_client = fixture.client(&first_server.url(), Duration::from_secs(10));
+    let (second_key, second_public_key) = cryptography::get_random_keypair();
+    fixture.tower_id = teos_common::UserId(second_public_key);
+    fixture.tower_key = second_key;
+    let second_receipt = fixture.receipt(101);
+    let second_client = fixture.client(&second_server.url(), Duration::from_secs(10));
+    // Both servers wait until the test performs a store write, proving that
+    // storage remains usable while both requests are in flight.
+    let gate = Arc::new((Mutex::new((0, false)), Condvar::new()));
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let arrived_tx = Arc::new(Mutex::new(Some(arrived_tx)));
+    let mut mocks = Vec::new();
+    for (server, receipt) in [
+        (&mut first_server, &first_receipt),
+        (&mut second_server, &second_receipt),
+    ] {
+        let gate = gate.clone();
+        let arrived_tx = arrived_tx.clone();
+        let body = fixture.response(receipt);
+        mocks.push(
+            server
+                .mock("POST", "/add_appointment")
+                .with_status(200)
+                .with_body_from_fn(move |writer| {
+                    let (lock, ready) = &*gate;
+                    let mut state = lock.lock().unwrap();
+                    state.0 += 1;
+                    if state.0 == 2 {
+                        arrived_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    }
+                    let (state, _) = ready
+                        .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+                        .unwrap();
+                    assert!(
+                        state.1,
+                        "Store write must complete before either tower responds"
+                    );
+                    writer.write_all(body.as_bytes())
+                })
+                .expect(1)
+                .create_async()
+                .await,
+        );
+    }
+    let job = fixture
+        .store
+        .pending_appointment(fixture.job.channel_id(), fixture.job.commitment_txid())
+        .unwrap()
+        .unwrap();
+    let first_send = first_client.send_appointment(&job);
+    let second_send = second_client.send_appointment(&job);
+    let other_txid = Txid::from_byte_array([8; 32]);
+    let mut other_entry =
+        common::justice(vec![common::to_local_with_fee(other_txid, 144, 0, 1000)]);
+    other_entry.revoked_commitment_txid = other_txid;
+    other_entry.commitment_number = 43;
+    let (first, second, added_job) = tokio::join!(first_send, second_send, async {
+        tokio::time::timeout(Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("Both tower requests must arrive")
+            .unwrap();
+        let added_job = fixture
+            .store
+            .prepare_appointment(job.channel_id(), &other_entry)
+            .unwrap()
+            .pending_appointment()
+            .unwrap()
+            .clone();
+        let (lock, ready) = &*gate;
+        lock.lock().unwrap().1 = true;
+        ready.notify_all();
+        added_job
+    });
+    assert_eq!(added_job.commitment_txid(), other_txid);
+    assert_eq!(
+        fixture
+            .store
+            .pending_appointment(job.channel_id(), other_txid)
+            .unwrap(),
+        Some(added_job)
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(fixture
+        .store
+        .appointment_receipt(first_id, job.channel_id(), job.commitment_txid())
+        .unwrap()
+        .is_none());
+    assert!(fixture.saved().is_none());
+    fixture.store.save_appointment_receipt(&first).unwrap();
+    fixture.store.save_appointment_receipt(&second).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .appointment_receipt(first_id, job.channel_id(), job.commitment_txid())
+            .unwrap(),
+        Some(first_receipt)
+    );
+    assert_eq!(fixture.saved(), Some(second_receipt));
+    fixture.assert_pending();
+    for mock in mocks {
+        mock.assert_async().await;
     }
 }

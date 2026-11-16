@@ -3,7 +3,7 @@
 //! This crate provides tower connection configuration, persistent client identity,
 //! explicit tower registration, claim classification with unclassified-claim diagnostics,
 //! durable appointment preparation, explicit submission with verified tower receipts,
-//! and TEOS locator derivation.
+//! network submission independent of storage access, and TEOS locator derivation.
 //! Prepared appointments cover revoked counterparty commitment
 //! `to_local` outputs. Preparation does not submit to a tower or acknowledge LDK
 //! delivery; HTLC outputs remain outside its scope.
@@ -28,7 +28,7 @@ pub use config::{TowerConfig, TowerConfigError};
 pub use dbm::{ClientStore, PendingAppointmentFailure, PendingAppointmentRecovery, StorageError};
 pub use identity::ClientIdentity;
 pub use registration::{RegistrationError, TowerClient};
-pub use submission::SubmissionError;
+pub use submission::{SubmissionError, VerifiedAppointmentReceipt};
 
 /// Derives the TEOS appointment locator for a revoked counterparty commitment.
 ///

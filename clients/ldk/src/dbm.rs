@@ -12,7 +12,7 @@ use teos_common::{
 };
 use teos_common::{TowerId, UserId};
 
-use crate::{ClientIdentity, PendingAppointment, PreparationError};
+use crate::{ClientIdentity, PendingAppointment, PreparationError, VerifiedAppointmentReceipt};
 
 // TODO: Before the LDK client's first release, add schema versioning and
 // transactional migrations in a separate follow-up. CREATE TABLE IF NOT EXISTS
@@ -261,12 +261,19 @@ impl ClientStore {
         Ok(receipt)
     }
 
-    pub(crate) fn store_appointment_receipt(
+    /// Persists a verified network result after rechecking its pending job.
+    ///
+    /// The job must still exist unchanged. Saving re-verifies the tower signature
+    /// and commits before returning success. If saving fails, the caller retains
+    /// the result and can retry the save without resubmitting to the tower.
+    /// Pending jobs are not removed and LDK delivery is not acknowledged.
+    pub fn save_appointment_receipt(
         &mut self,
-        tower_id: TowerId,
-        job: &PendingAppointment,
-        receipt: &AppointmentReceipt,
+        delivery: &VerifiedAppointmentReceipt,
     ) -> Result<(), StorageError> {
+        let tower_id = delivery.tower_id();
+        let job = delivery.job();
+        let receipt = delivery.receipt();
         if receipt.user_signature() != job.signature() || !receipt.verify(&tower_id) {
             return Err(StorageError::InvalidAppointmentReceipt);
         }
