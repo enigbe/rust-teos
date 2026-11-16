@@ -66,6 +66,18 @@ ON CONFLICT (tower_id, user_id, subscription_expiry) DO UPDATE SET
 const SELECT_PENDING_APPOINTMENTS: &str = "SELECT rowid, channel_id, commitment_txid, user_id, locator, encrypted_blob, to_self_delay, signature
 FROM pending_appointments ORDER BY channel_id, commitment_txid";
 
+const SELECT_UNDELIVERED_APPOINTMENTS: &str = "SELECT p.rowid, p.channel_id, p.commitment_txid, p.user_id, p.locator, p.encrypted_blob, p.to_self_delay, p.signature
+FROM pending_appointments AS p
+WHERE NOT EXISTS (
+    SELECT 1 FROM appointment_receipts AS r
+    WHERE r.tower_id=?1 AND r.channel_id=p.channel_id AND r.commitment_txid=p.commitment_txid
+)
+ORDER BY p.channel_id, p.commitment_txid";
+
+const SELECT_DELIVERY_JOB_STATUS: &str = "SELECT EXISTS (
+    SELECT 1 FROM appointment_receipts WHERE tower_id=?1 AND channel_id=?2 AND commitment_txid=?3
+) FROM pending_appointments WHERE channel_id=?2 AND commitment_txid=?3";
+
 const INSERT_PENDING_APPOINTMENT: &str = "INSERT INTO pending_appointments (channel_id, commitment_txid, user_id, locator, encrypted_blob, to_self_delay, signature)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
@@ -86,6 +98,12 @@ ON CONFLICT (tower_id, channel_id, commitment_txid, start_block) DO UPDATE SET
 const SELECT_APPOINTMENT_RECEIPT: &str = "SELECT user_signature, start_block, tower_signature
 FROM appointment_receipts WHERE tower_id=?1 AND channel_id=?2 AND commitment_txid=?3
 ORDER BY start_block DESC LIMIT 1";
+
+pub(crate) enum DeliveryJobStatus {
+    Missing,
+    Recorded,
+    Unrecorded,
+}
 
 /// SQLite storage for the LDK watchtower client.
 ///
@@ -322,12 +340,56 @@ impl ClientStore {
     /// Query failures or an invalid stored identity fail the operation; row decoding
     /// and appointment validation failures are collected in the report instead.
     pub fn pending_appointments(&self) -> Result<PendingAppointmentRecovery, StorageError> {
+        self.recover_pending(SELECT_PENDING_APPOINTMENTS, [])
+    }
+
+    /// Recovers only jobs with no receipt row for this tower, filtering in SQLite
+    /// before cryptographic validation. Receipt presence suppresses resending even
+    /// if the receipt is corrupt. Use [`Self::appointment_receipt`] to verify stored
+    /// evidence explicitly, or [`Self::pending_appointments`] to audit all source jobs.
+    pub fn undelivered_appointments(
+        &self,
+        tower_id: TowerId,
+    ) -> Result<PendingAppointmentRecovery, StorageError> {
+        self.recover_pending(SELECT_UNDELIVERED_APPOINTMENTS, params![tower_id.to_vec()])
+    }
+
+    pub(crate) fn delivery_job_status(
+        &self,
+        tower_id: TowerId,
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+    ) -> Result<DeliveryJobStatus, StorageError> {
+        let recorded: Option<bool> = self
+            .connection
+            .query_row(
+                SELECT_DELIVERY_JOB_STATUS,
+                params![
+                    tower_id.to_vec(),
+                    &channel_id.0[..],
+                    &commitment_txid.to_byte_array()[..]
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match recorded {
+            None => DeliveryJobStatus::Missing,
+            Some(true) => DeliveryJobStatus::Recorded,
+            Some(false) => DeliveryJobStatus::Unrecorded,
+        })
+    }
+
+    fn recover_pending(
+        &self,
+        query: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<PendingAppointmentRecovery, StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
         let expected_user = read_identity(&transaction)?.map(|identity| identity.user_id());
         let mut report = PendingAppointmentRecovery::default();
         {
-            let mut statement = transaction.prepare(SELECT_PENDING_APPOINTMENTS)?;
-            let mut rows = statement.query([])?;
+            let mut statement = transaction.prepare(query)?;
+            let mut rows = statement.query(params)?;
             while let Some(row) = rows.next()? {
                 let row_id = row.get(0)?;
                 match StoredAppointment::read(row)

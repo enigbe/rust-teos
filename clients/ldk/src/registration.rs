@@ -14,6 +14,7 @@ use crate::{ClientStore, StorageError, TowerConfig};
 /// An HTTP client for a single TEOS tower.
 ///
 /// Constructing this does not contact the tower. Requests require a Tokio runtime.
+#[derive(Clone)]
 pub struct TowerClient {
     pub(crate) config: TowerConfig,
     pub(crate) http: Client,
