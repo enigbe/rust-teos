@@ -4,7 +4,7 @@
 //! explicit tower registration, claim classification with unclassified-claim diagnostics,
 //! durable appointment preparation, explicit submission with verified tower receipts,
 //! network submission independent of storage access, caller-driven delivery retries,
-//! and TEOS locator derivation.
+//! an LDK persistence adapter with conservative acknowledgment, and TEOS locator derivation.
 //! Prepared appointments cover revoked counterparty commitment
 //! `to_local` outputs. Preparation does not submit to a tower or acknowledge LDK
 //! delivery; HTLC outputs remain outside its scope.
@@ -18,6 +18,7 @@ mod config;
 mod dbm;
 mod delivery;
 mod identity;
+mod ldk_adapter;
 mod registration;
 mod submission;
 
@@ -33,6 +34,10 @@ pub use delivery::{
     DeliveryStatus, InvalidDeliveryCompletion, InvalidRetryPolicy, RetryPolicy,
 };
 pub use identity::ClientIdentity;
+pub use ldk_adapter::{
+    ClaimCoverage, LdkAdapterConfigError, LdkAdapterEvent, LdkDeliveryBatch, LdkWatchtowerAdapter,
+    LdkWatchtowerWorker,
+};
 pub use registration::{RegistrationError, TowerClient};
 pub use submission::{SubmissionError, VerifiedAppointmentReceipt};
 

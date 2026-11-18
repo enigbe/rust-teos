@@ -421,7 +421,9 @@ impl DeliveryCoordinator {
         completion: DeliveryCompletion,
         now: Instant,
     ) -> Result<DeliveryEvent, InvalidDeliveryCompletion> {
-        let DeliveryCompletion { id, token, result } = completion;
+        let DeliveryCompletion {
+            id, token, result, ..
+        } = completion;
         let mut cycle = match self.states.get(&id) {
             Some(State::Sending {
                 cycle,
@@ -617,6 +619,7 @@ impl DeliveryAttempt {
     pub async fn send(self) -> DeliveryCompletion {
         let result = self.tower.send_appointment(&self.job).await;
         DeliveryCompletion {
+            tower_id: self.tower.config.tower_id(),
             id: self.id,
             token: self.token,
             result,
@@ -627,9 +630,16 @@ impl DeliveryAttempt {
 /// A network result bound to its issuing coordinator and attempt.
 /// Dropping it without finishing leaves no durable receipt and permits a later retry.
 pub struct DeliveryCompletion {
+    tower_id: TowerId,
     id: JobId,
     token: Arc<()>,
     result: Result<VerifiedAppointmentReceipt, SubmissionError>,
+}
+impl DeliveryCompletion {
+    /// Returns the issuing tower, allowing a multi-tower worker to route this result.
+    pub fn tower_id(&self) -> TowerId {
+        self.tower_id
+    }
 }
 /// A completion was passed to a coordinator which did not issue its active attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
