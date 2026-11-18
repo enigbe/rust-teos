@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ldk_watchtower_client::{
-    ClientStore, DeliveryAttempt, DeliveryCoordinator, LdkAdapterEvent, LdkWatchtowerAdapter,
-    LdkWatchtowerWorker, PendingAppointment, RetryPolicy, TowerClient, TowerConfig,
+    ClientStore, CoverageOutcome, DeliveryAttempt, DeliveryCoordinator, LdkAdapterEvent,
+    LdkWatchtowerAdapter, LdkWatchtowerWorker, PendingAppointment, ProtectionScope, RetryPolicy,
+    TowerClient, TowerConfig,
 };
 use lightning::chain::chainmonitor::WatchtowerPersist;
 use lightning::ln::types::ChannelId;
@@ -48,6 +49,7 @@ impl Fixture {
             })
             .collect();
         let worker = LdkWatchtowerWorker::new(
+            ProtectionScope::ToLocalOnly,
             store,
             coordinators,
             1000,
@@ -110,7 +112,7 @@ async fn acknowledges_only_after_a_verified_receipt_is_saved_and_notifies_ldk() 
         .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
     let now = Instant::now();
     let (mut attempts, events) = f.attempts(now);
-    assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::Coverage { coverage, .. } if coverage.is_complete())));
+    assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::Coverage { coverage, .. } if coverage.outcome(ProtectionScope::ToLocalOnly) == CoverageOutcome::ToLocalAppointment)));
     assert!(completed(&f.adapter).is_empty());
     let job = f.job();
     let mock = server
@@ -141,22 +143,28 @@ async fn acknowledges_only_after_a_verified_receipt_is_saved_and_notifies_ldk() 
 }
 
 #[tokio::test]
-async fn htlc_unknown_and_missing_claims_are_not_acknowledged() {
+async fn recognized_htlcs_are_excluded_while_unknown_claims_block_acknowledgment() {
     let mut unknown = common::to_local(144, 1);
     unknown.input[0].witness.clear();
-    for txs in [
-        vec![common::to_local(144, 0), common::htlc(true, false)],
-        vec![common::to_local(144, 0), unknown],
-        vec![common::htlc(false, true)],
-        vec![],
+    for (txs, should_ack) in [
+        (
+            vec![common::to_local(144, 0), common::htlc(true, false)],
+            true,
+        ),
+        (vec![common::to_local(144, 0), unknown.clone()], false),
+        (vec![unknown], false),
+        (vec![common::htlc(false, true)], true),
+        (vec![], true),
     ] {
         let mut server = Server::new_async().await;
         let mut f = Fixture::new(&[&server.url()]);
+        let entry = common::justice(txs);
+        let txid = entry.revoked_commitment_txid;
         f.adapter
-            .queue_justice_transactions(CHANNEL, Ok(vec![common::justice(txs)]));
+            .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
         let now = Instant::now();
         let (attempts, events) = f.attempts(now);
-        assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::Coverage { coverage, .. } if !coverage.is_complete())));
+        assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::Coverage { coverage, .. } if coverage.satisfies(ProtectionScope::ToLocalOnly) == should_ack)));
         for attempt in attempts {
             let mock = server
                 .mock("POST", "/add_appointment")
@@ -168,7 +176,10 @@ async fn htlc_unknown_and_missing_claims_are_not_acknowledged() {
             f.worker.finish(attempt.send().await, now).unwrap();
             mock.assert_async().await;
         }
-        assert!(completed(&f.adapter).is_empty());
+        assert_eq!(!completed(&f.adapter).is_empty(), should_ack);
+        let records = f.worker.store().coverage_records(CHANNEL, txid).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].completion_ready(), should_ack);
     }
 }
 
@@ -230,12 +241,14 @@ async fn new_incomplete_or_unavailable_snapshots_invalidate_queued_acknowledgmen
         f.worker
             .finish(attempts.pop().unwrap().send().await, now)
             .unwrap();
+        let mut unknown = common::to_local(144, 1);
+        unknown.input[0].witness.clear();
         let snapshot = if unavailable {
             Err(())
         } else {
             Ok(vec![common::justice(vec![
                 common::to_local(144, 0),
-                common::htlc(true, false),
+                unknown,
             ])])
         };
         f.adapter.queue_justice_transactions(CHANNEL, snapshot);
@@ -338,7 +351,7 @@ async fn failed_receipt_saves_do_not_ack_and_successful_local_retry_does() {
 }
 
 #[tokio::test]
-async fn a_covered_commitment_completes_independently_of_an_htlc_commitment() {
+async fn both_to_local_and_htlc_bearing_commitments_complete_under_the_selected_scope() {
     use lightning::bitcoin::{hashes::Hash, Txid};
     let mut server = Server::new_async().await;
     let mut f = Fixture::new(&[&server.url()]);
@@ -365,7 +378,9 @@ async fn a_covered_commitment_completes_independently_of_an_htlc_commitment() {
         f.worker.finish(attempt.send().await, now).unwrap();
         mock.assert_async().await;
     }
-    assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
+    let acks = completed(&f.adapter);
+    assert_eq!(acks.len(), 2);
+    assert!(acks.contains(&(CHANNEL, txid)));
 }
 
 #[tokio::test]
@@ -410,6 +425,7 @@ fn requires_a_nonempty_unique_tower_set_and_valid_signing_settings() {
     let destination = common::to_local(144, 0).output[0].script_pubkey.clone();
     assert!(matches!(
         LdkWatchtowerWorker::new(
+            ProtectionScope::ToLocalOnly,
             ClientStore::open(":memory:").unwrap(),
             vec![],
             1000,
@@ -419,6 +435,7 @@ fn requires_a_nonempty_unique_tower_set_and_valid_signing_settings() {
     ));
     assert!(matches!(
         LdkWatchtowerWorker::new(
+            ProtectionScope::ToLocalOnly,
             ClientStore::open(":memory:").unwrap(),
             vec![],
             0,
@@ -428,6 +445,7 @@ fn requires_a_nonempty_unique_tower_set_and_valid_signing_settings() {
     ));
     assert!(matches!(
         LdkWatchtowerWorker::new(
+            ProtectionScope::ToLocalOnly,
             ClientStore::open(":memory:").unwrap(),
             vec![],
             1000,
@@ -448,7 +466,7 @@ fn requires_a_nonempty_unique_tower_set_and_valid_signing_settings() {
         )
     };
     assert!(
-        matches!(LdkWatchtowerWorker::new(ClientStore::open(":memory:").unwrap(), vec![make(), make()], 1000, destination), Err(LdkAdapterConfigError::DuplicateTower(id)) if id == tower_id)
+        matches!(LdkWatchtowerWorker::new(ProtectionScope::ToLocalOnly, ClientStore::open(":memory:").unwrap(), vec![make(), make()], 1000, destination), Err(LdkAdapterConfigError::DuplicateTower(id)) if id == tower_id)
     );
 }
 
@@ -478,6 +496,7 @@ async fn restart_reconstructs_eligibility_and_uses_saved_receipts() {
     )
     .unwrap();
     f.worker = LdkWatchtowerWorker::new(
+        ProtectionScope::ToLocalOnly,
         store,
         vec![DeliveryCoordinator::new(
             client,
@@ -556,7 +575,7 @@ async fn a_saved_payload_for_another_outpoint_cannot_cover_a_new_offer() {
     );
     let (attempts, events) = f.attempts(now);
     assert!(attempts.is_empty());
-    assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::Coverage { coverage, .. } if coverage.to_local() && !coverage.stored_claim_matches() && !coverage.is_complete())));
+    assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::Coverage { coverage, .. } if coverage.to_local() && !coverage.stored_claim_matches() && !coverage.satisfies(ProtectionScope::ToLocalOnly))));
     assert!(completed(&f.adapter).is_empty());
     mock.assert_async().await;
 }
@@ -635,9 +654,13 @@ fn a_receipt_for_a_replaced_database_job_cannot_satisfy_an_old_snapshot() {
         .unwrap()
         .is_some());
     let (_, events) = f.attempts(now);
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, LdkAdapterEvent::ReceiptCheckFailed { .. })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LdkAdapterEvent::CoverageStorageFailed {
+            error: ldk_watchtower_client::StorageError::InvalidPendingAppointment,
+            ..
+        }
+    )));
     assert!(completed(&f.adapter).is_empty());
     drop(attempts);
 }
@@ -785,5 +808,190 @@ async fn finishing_one_commitment_does_not_audit_unrelated_pending_commitments()
     assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::ReceiptCheckFailed { commitment_txid, .. } if *commitment_txid == other_txid)));
     assert!(completed(&f.adapter).is_empty());
     drop(other);
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn htlc_only_and_empty_snapshots_persist_the_reason_without_a_tower_request() {
+    for (txs, outcome, excluded) in [
+        (
+            vec![common::htlc(true, false)],
+            CoverageOutcome::NoToLocalClaimAtFeeRate,
+            1,
+        ),
+        (vec![], CoverageOutcome::NoClaimsAtFeeRate, 0),
+    ] {
+        let mut server = Server::new_async().await;
+        let mut f = Fixture::new(&[&server.url()]);
+        let mock = server
+            .mock("POST", "/add_appointment")
+            .expect(0)
+            .create_async()
+            .await;
+        let entry = common::justice(txs);
+        let txid = entry.revoked_commitment_txid;
+        f.adapter
+            .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
+        let (attempts, events) = f.attempts(Instant::now());
+        assert!(attempts.is_empty());
+        assert!(events.iter().any(|event| matches!(event,
+            LdkAdapterEvent::NoApplicableClaimAtFeeRate { commitment_txid, feerate_per_kw: 1000, outcome: observed, coverage_id, .. }
+            if *commitment_txid == txid && *observed == outcome && *coverage_id > 0
+        )));
+        assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
+        let reopened = ClientStore::open(f.dir.path().join("client.sqlite")).unwrap();
+        let records = reopened.coverage_records(CHANNEL, txid).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.scope(), ProtectionScope::ToLocalOnly);
+        assert_eq!(record.outcome(), outcome);
+        assert_eq!(record.excluded_htlc_claims(), excluded);
+        assert_eq!(record.feerate_per_kw(), 1000);
+        assert_eq!(record.required_towers(), &[f.towers[0].0]);
+        assert!(record.client_signature().is_none());
+        assert!(record.completion_ready());
+        assert!(reopened.pending_appointments().unwrap().jobs().is_empty());
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn a_coverage_write_failure_withholds_ack_and_retries_the_snapshot_after_repair() {
+    let mut f = Fixture::new(&["http://127.0.0.1:0"]);
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_coverage BEFORE INSERT ON coverage_records BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    let entry = common::justice(vec![common::htlc(true, false)]);
+    let txid = entry.revoked_commitment_txid;
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
+    let (attempts, events) = f.attempts(Instant::now());
+    assert!(attempts.is_empty());
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, LdkAdapterEvent::CoverageStorageFailed { .. })));
+    assert!(completed(&f.adapter).is_empty());
+    assert!(f.worker.has_pending_preparations());
+    assert!(f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, txid)
+        .unwrap()
+        .is_empty());
+    db.execute_batch("DROP TRIGGER fail_coverage").unwrap();
+    f.attempts(Instant::now());
+    assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
+    assert!(f.worker.store().coverage_records(CHANNEL, txid).unwrap()[0].completion_ready());
+}
+
+#[tokio::test]
+async fn a_completion_marker_failure_keeps_coverage_pending_without_resubmission() {
+    let mut server = Server::new_async().await;
+    let mut f = Fixture::new(&[&server.url()]);
+    let entry = common::justice(vec![common::to_local(144, 0), common::htlc(true, false)]);
+    let txid = entry.revoked_commitment_txid;
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
+    let now = Instant::now();
+    let (mut attempts, _) = f.attempts(now);
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&f.job(), 0))
+        .expect(1)
+        .create_async()
+        .await;
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE OF completion_ready ON coverage_records BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    let events = f
+        .worker
+        .finish(attempts.pop().unwrap().send().await, now)
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, LdkAdapterEvent::CoverageStorageFailed { .. })));
+    assert!(completed(&f.adapter).is_empty());
+    assert!(!f.worker.store().coverage_records(CHANNEL, txid).unwrap()[0].completion_ready());
+    assert!(f
+        .worker
+        .store()
+        .appointment_receipt(f.towers[0].0, CHANNEL, txid)
+        .unwrap()
+        .is_some());
+    db.execute_batch("DROP TRIGGER fail_completion").unwrap();
+    assert!(f.attempts(now).0.is_empty());
+    assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
+    let record = &f.worker.store().coverage_records(CHANNEL, txid).unwrap()[0];
+    assert_eq!(record.excluded_htlc_claims(), 1);
+    assert!(record.completion_ready());
+    mock.assert_async().await;
+}
+
+#[test]
+fn identical_observations_are_reused_and_changed_exclusions_preserve_history() {
+    let mut f = Fixture::new(&["http://127.0.0.1:0"]);
+    let entry = common::justice(vec![common::htlc(true, false)]);
+    let txid = entry.revoked_commitment_txid;
+    let now = Instant::now();
+    for _ in 0..2 {
+        f.adapter
+            .queue_justice_transactions(CHANNEL, Ok(vec![entry.clone()]));
+        assert!(f.attempts(now).0.is_empty());
+        assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
+    }
+    let original = f.worker.store().coverage_records(CHANNEL, txid).unwrap();
+    assert_eq!(original.len(), 1);
+    assert_eq!(
+        f.worker.store().coverage_record(original[0].id()).unwrap(),
+        Some(original[0].clone())
+    );
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![
+            common::htlc(true, false),
+            common::htlc(false, true),
+        ])]),
+    );
+    f.attempts(now);
+    assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
+    let records = f.worker.store().coverage_records(CHANNEL, txid).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0], original[0]);
+    assert_eq!(records[1].excluded_htlc_claims(), 2);
+    assert!(records[1].completion_ready());
+}
+
+#[tokio::test]
+async fn changed_coverage_metadata_cannot_authorize_an_in_flight_acknowledgment() {
+    let mut server = Server::new_async().await;
+    let mut f = Fixture::new(&[&server.url()]);
+    let entry = common::justice(vec![common::to_local(144, 0), common::htlc(true, false)]);
+    let txid = entry.revoked_commitment_txid;
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
+    let now = Instant::now();
+    let (mut attempts, _) = f.attempts(now);
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&f.job(), 0))
+        .expect(1)
+        .create_async()
+        .await;
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    db.execute("UPDATE coverage_records SET unclassified_claims=1", [])
+        .unwrap();
+    let events = f
+        .worker
+        .finish(attempts.pop().unwrap().send().await, now)
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, LdkAdapterEvent::CoverageStorageFailed { .. })));
+    assert!(completed(&f.adapter).is_empty());
+    assert!(!f.worker.store().coverage_records(CHANNEL, txid).unwrap()[0].completion_ready());
+    db.execute("UPDATE coverage_records SET unclassified_claims=0", [])
+        .unwrap();
+    assert!(f.attempts(now).0.is_empty());
+    assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
     mock.assert_async().await;
 }

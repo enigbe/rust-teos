@@ -4,7 +4,7 @@
 //! explicit tower registration, claim classification with unclassified-claim diagnostics,
 //! durable appointment preparation, explicit submission with verified tower receipts,
 //! network submission independent of storage access, caller-driven delivery retries,
-//! an LDK persistence adapter with conservative acknowledgment, and TEOS locator derivation.
+//! an LDK persistence adapter with explicit protection scope, and TEOS locator derivation.
 //! Prepared appointments cover revoked counterparty commitment
 //! `to_local` outputs. Preparation does not submit to a tower or acknowledge LDK
 //! delivery; HTLC outputs remain outside its scope.
@@ -15,6 +15,7 @@ use teos_common::appointment::Locator;
 mod appointments;
 mod claims;
 mod config;
+mod coverage;
 mod dbm;
 mod delivery;
 mod identity;
@@ -28,6 +29,7 @@ pub use claims::{
     UnclassifiedClaim, UnclassifiedClaimReason,
 };
 pub use config::{TowerConfig, TowerConfigError};
+pub use coverage::{CoverageOutcome, CoverageRecord, ProtectionScope};
 pub use dbm::{ClientStore, PendingAppointmentFailure, PendingAppointmentRecovery, StorageError};
 pub use delivery::{
     DeliveryAttempt, DeliveryBatch, DeliveryCompletion, DeliveryCoordinator, DeliveryEvent,

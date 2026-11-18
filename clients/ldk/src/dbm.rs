@@ -12,7 +12,29 @@ use teos_common::{
 };
 use teos_common::{TowerId, UserId};
 
-use crate::{ClientIdentity, PendingAppointment, PreparationError, VerifiedAppointmentReceipt};
+use crate::{
+    ClientIdentity, CoverageOutcome, CoverageRecord, PendingAppointment, PreparationError,
+    ProtectionScope, VerifiedAppointmentReceipt,
+};
+
+/// Identifies receipt failures without repeating verification outside the transaction.
+pub(crate) enum CoverageCompletionError {
+    Storage(StorageError),
+    Receipt {
+        tower_id: TowerId,
+        error: StorageError,
+    },
+}
+impl From<StorageError> for CoverageCompletionError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+impl From<rusqlite::Error> for CoverageCompletionError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(StorageError::from(error))
+    }
+}
 
 // TODO: Before the LDK client's first release, add schema versioning and
 // transactional migrations in a separate follow-up. CREATE TABLE IF NOT EXISTS
@@ -48,6 +70,22 @@ CREATE TABLE IF NOT EXISTS appointment_receipts (
     start_block INTEGER NOT NULL,
     tower_signature TEXT NOT NULL,
     PRIMARY KEY (tower_id, channel_id, commitment_txid, start_block)
+);
+CREATE TABLE IF NOT EXISTS coverage_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
+    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
+    scope INTEGER NOT NULL,
+    feerate_per_kw INTEGER NOT NULL CHECK (feerate_per_kw > 0),
+    to_local INTEGER NOT NULL CHECK (to_local IN (0, 1)),
+    excluded_htlc_claims INTEGER NOT NULL CHECK (excluded_htlc_claims >= 0),
+    unclassified_claims INTEGER NOT NULL CHECK (unclassified_claims >= 0),
+    stored_claim_matches INTEGER NOT NULL CHECK (stored_claim_matches IN (0, 1)),
+    client_signature TEXT NOT NULL,
+    required_towers BLOB NOT NULL,
+    completion_ready INTEGER NOT NULL DEFAULT 0 CHECK (completion_ready IN (0, 1)),
+    UNIQUE (channel_id, commitment_txid, scope, feerate_per_kw, to_local,
+        excluded_htlc_claims, unclassified_claims, stored_claim_matches, client_signature, required_towers)
 );";
 
 const SELECT_REGISTRATION: &str =
@@ -98,6 +136,30 @@ ON CONFLICT (tower_id, channel_id, commitment_txid, start_block) DO UPDATE SET
 const SELECT_APPOINTMENT_RECEIPT: &str = "SELECT user_signature, start_block, tower_signature
 FROM appointment_receipts WHERE tower_id=?1 AND channel_id=?2 AND commitment_txid=?3
 ORDER BY start_block DESC LIMIT 1";
+
+const INSERT_COVERAGE: &str = "INSERT INTO coverage_records
+    (channel_id, commitment_txid, scope, feerate_per_kw, to_local, excluded_htlc_claims,
+     unclassified_claims, stored_claim_matches, client_signature, required_towers)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
+const SELECT_COVERAGE_OBSERVATION: &str = "SELECT id, channel_id, commitment_txid, scope,
+    feerate_per_kw, to_local, excluded_htlc_claims, unclassified_claims,
+    stored_claim_matches, client_signature, required_towers, completion_ready
+FROM coverage_records WHERE channel_id=?1 AND commitment_txid=?2 AND scope=?3
+    AND feerate_per_kw=?4 AND to_local=?5 AND excluded_htlc_claims=?6
+    AND unclassified_claims=?7 AND stored_claim_matches=?8 AND client_signature=?9 AND required_towers=?10";
+
+const SELECT_COVERAGE_BY_ID: &str = "SELECT id, channel_id, commitment_txid, scope,
+    feerate_per_kw, to_local, excluded_htlc_claims, unclassified_claims,
+    stored_claim_matches, client_signature, required_towers, completion_ready
+FROM coverage_records WHERE id=?1";
+
+const SELECT_COVERAGE_FOR_COMMITMENT: &str = "SELECT id, channel_id, commitment_txid, scope,
+    feerate_per_kw, to_local, excluded_htlc_claims, unclassified_claims,
+    stored_claim_matches, client_signature, required_towers, completion_ready
+FROM coverage_records WHERE channel_id=?1 AND commitment_txid=?2 ORDER BY id";
+
+const COMPLETE_COVERAGE: &str = "UPDATE coverage_records SET completion_ready=1 WHERE id=?1";
 
 pub(crate) enum DeliveryJobStatus {
     Missing,
@@ -251,23 +313,7 @@ impl ClientStore {
         commitment_txid: Txid,
     ) -> Result<Option<AppointmentReceipt>, StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let receipt = transaction
-            .query_row(
-                SELECT_APPOINTMENT_RECEIPT,
-                params![
-                    tower_id.to_vec(),
-                    &channel_id.0[..],
-                    &commitment_txid.to_byte_array()[..]
-                ],
-                |row| {
-                    Ok(AppointmentReceipt::with_signature(
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let receipt = find_receipt(&transaction, tower_id, channel_id, commitment_txid)?;
         if let Some(receipt) = &receipt {
             let job = find_pending(&transaction, channel_id, commitment_txid)?
                 .ok_or(StorageError::InvalidAppointmentReceipt)?;
@@ -446,6 +492,243 @@ impl ClientStore {
     }
 }
 
+impl ClientStore {
+    /// Loads immutable coverage observations for a commitment, including excluded
+    /// claim counts. These records remain readable independently of source jobs.
+    pub fn coverage_records(
+        &self,
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+    ) -> Result<Vec<CoverageRecord>, StorageError> {
+        let mut statement = self.connection.prepare(SELECT_COVERAGE_FOR_COMMITMENT)?;
+        let rows = statement.query_map(
+            params![&channel_id.0[..], &commitment_txid.to_byte_array()[..]],
+            RawCoverage::read,
+        )?;
+        rows.map(|row| row.map_err(StorageError::from)?.validate())
+            .collect()
+    }
+    /// Loads one observation by its stable identifier and validates stored metadata.
+    pub fn coverage_record(&self, id: i64) -> Result<Option<CoverageRecord>, StorageError> {
+        read_coverage(&self.connection, id)
+    }
+    pub(crate) fn record_coverage(
+        &mut self,
+        observation: CoverageRecord,
+    ) -> Result<CoverageRecord, StorageError> {
+        observation.validate()?;
+        if let Some(record) = find_coverage(&self.connection, &observation)? {
+            return Ok(record);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = match find_coverage(&transaction, &observation)? {
+            Some(record) => record,
+            None => {
+                transaction.execute(
+                    INSERT_COVERAGE,
+                    params![
+                        &observation.channel_id.0[..],
+                        &observation.commitment_txid.to_byte_array()[..],
+                        observation.scope.id(),
+                        observation.feerate_per_kw,
+                        observation.to_local,
+                        observation.excluded_htlc_claims,
+                        observation.unclassified_claims,
+                        observation.stored_claim_matches,
+                        observation.client_signature.as_deref().unwrap_or(""),
+                        tower_bytes(&observation.required_towers),
+                    ],
+                )?;
+                read_coverage(&transaction, transaction.last_insert_rowid())?
+                    .ok_or(StorageError::InvalidCoverage)?
+            }
+        };
+        transaction.commit()?;
+        Ok(record)
+    }
+    // Receipt checks and the durable readiness marker share a transaction. A
+    // missing receipt is ordinary pending work; corrupt evidence is an error.
+    pub(crate) fn complete_coverage(
+        &mut self,
+        expected: &CoverageRecord,
+    ) -> Result<bool, CoverageCompletionError> {
+        let transaction = self.connection.transaction()?;
+        let record =
+            read_coverage(&transaction, expected.id)?.ok_or(StorageError::InvalidCoverage)?;
+        if !record.same_observation(expected) || record.outcome() == CoverageOutcome::Blocked {
+            return Err(StorageError::InvalidCoverage.into());
+        }
+        if record.outcome() == CoverageOutcome::ToLocalAppointment {
+            let job = find_pending(&transaction, record.channel_id, record.commitment_txid)?
+                .ok_or(StorageError::InvalidPendingAppointment)?;
+            if Some(job.signature()) != record.client_signature() {
+                return Err(StorageError::InvalidPendingAppointment.into());
+            }
+            for tower in &record.required_towers {
+                let receipt = find_receipt(
+                    &transaction,
+                    *tower,
+                    record.channel_id,
+                    record.commitment_txid,
+                )
+                .map_err(|error| CoverageCompletionError::Receipt {
+                    tower_id: *tower,
+                    error,
+                })?;
+                let Some(receipt) = receipt else {
+                    return Ok(false);
+                };
+                if receipt.user_signature() != job.signature() || !receipt.verify(tower) {
+                    return Err(CoverageCompletionError::Receipt {
+                        tower_id: *tower,
+                        error: StorageError::InvalidAppointmentReceipt,
+                    });
+                }
+            }
+        }
+        if !record.completion_ready {
+            transaction.execute(COMPLETE_COVERAGE, [record.id])?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+}
+
+// Decode only; callers verify against their source job within the same transaction.
+fn find_receipt(
+    connection: &Connection,
+    tower_id: TowerId,
+    channel_id: ChannelId,
+    commitment_txid: Txid,
+) -> Result<Option<AppointmentReceipt>, StorageError> {
+    Ok(connection
+        .query_row(
+            SELECT_APPOINTMENT_RECEIPT,
+            params![
+                tower_id.to_vec(),
+                &channel_id.0[..],
+                &commitment_txid.to_byte_array()[..]
+            ],
+            |row| {
+                Ok(AppointmentReceipt::with_signature(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                ))
+            },
+        )
+        .optional()?)
+}
+
+fn tower_bytes(towers: &[TowerId]) -> Vec<u8> {
+    towers.iter().flat_map(TowerId::to_vec).collect()
+}
+
+fn read_coverage(connection: &Connection, id: i64) -> Result<Option<CoverageRecord>, StorageError> {
+    connection
+        .query_row(SELECT_COVERAGE_BY_ID, [id], RawCoverage::read)
+        .optional()?
+        .map(RawCoverage::validate)
+        .transpose()
+}
+fn find_coverage(
+    connection: &Connection,
+    record: &CoverageRecord,
+) -> Result<Option<CoverageRecord>, StorageError> {
+    connection
+        .query_row(
+            SELECT_COVERAGE_OBSERVATION,
+            params![
+                &record.channel_id.0[..],
+                &record.commitment_txid.to_byte_array()[..],
+                record.scope.id(),
+                record.feerate_per_kw,
+                record.to_local,
+                record.excluded_htlc_claims,
+                record.unclassified_claims,
+                record.stored_claim_matches,
+                record.client_signature.as_deref().unwrap_or(""),
+                tower_bytes(&record.required_towers)
+            ],
+            RawCoverage::read,
+        )
+        .optional()?
+        .map(RawCoverage::validate)
+        .transpose()
+}
+
+struct RawCoverage {
+    id: i64,
+    channel: Vec<u8>,
+    txid: Vec<u8>,
+    scope: i64,
+    fee: u64,
+    to_local: i64,
+    htlcs: usize,
+    unknown: usize,
+    matches: i64,
+    signature: String,
+    towers: Vec<u8>,
+    ready: i64,
+}
+impl RawCoverage {
+    fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            channel: row.get(1)?,
+            txid: row.get(2)?,
+            scope: row.get(3)?,
+            fee: row.get(4)?,
+            to_local: row.get(5)?,
+            htlcs: row.get(6)?,
+            unknown: row.get(7)?,
+            matches: row.get(8)?,
+            signature: row.get(9)?,
+            towers: row.get(10)?,
+            ready: row.get(11)?,
+        })
+    }
+    fn validate(self) -> Result<CoverageRecord, StorageError> {
+        let invalid = || StorageError::InvalidCoverage;
+        fn flag(value: i64) -> Result<bool, StorageError> {
+            match value {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(StorageError::InvalidCoverage),
+            }
+        }
+        if self.id <= 0 || self.towers.is_empty() || self.towers.len() % 33 != 0 {
+            return Err(invalid());
+        }
+        let record = CoverageRecord {
+            id: self.id,
+            channel_id: ChannelId(self.channel.try_into().map_err(|_| invalid())?),
+            commitment_txid: Txid::from_slice(&self.txid).map_err(|_| invalid())?,
+            scope: ProtectionScope::from_id(self.scope).ok_or_else(invalid)?,
+            feerate_per_kw: self.fee,
+            to_local: flag(self.to_local)?,
+            excluded_htlc_claims: self.htlcs,
+            unclassified_claims: self.unknown,
+            stored_claim_matches: flag(self.matches)?,
+            client_signature: if self.signature.is_empty() {
+                None
+            } else {
+                Some(self.signature)
+            },
+            required_towers: self
+                .towers
+                .chunks_exact(33)
+                .map(|bytes| TowerId::from_slice(bytes).map_err(|_| invalid()))
+                .collect::<Result<_, _>>()?,
+            completion_ready: flag(self.ready)?,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
 fn find_pending(
     connection: &Connection,
     channel_id: ChannelId,
@@ -541,6 +824,8 @@ pub enum StorageError {
     InvalidPendingAppointment,
     /// A stored tower receipt is invalid or does not match its pending job.
     InvalidAppointmentReceipt,
+    /// A coverage observation is corrupt, changed, or incompatible with its policy.
+    InvalidCoverage,
 }
 
 impl From<rusqlite::Error> for StorageError {
@@ -557,6 +842,7 @@ impl fmt::Display for StorageError {
             Self::InvalidRegistration => write!(f, "Stored tower registration is invalid"),
             Self::InvalidPendingAppointment => write!(f, "Stored pending appointment is invalid"),
             Self::InvalidAppointmentReceipt => write!(f, "Stored appointment receipt is invalid"),
+            Self::InvalidCoverage => write!(f, "Stored coverage record is invalid"),
         }
     }
 }
@@ -568,7 +854,8 @@ impl Error for StorageError {
             Self::InvalidIdentity
             | Self::InvalidRegistration
             | Self::InvalidPendingAppointment
-            | Self::InvalidAppointmentReceipt => None,
+            | Self::InvalidAppointmentReceipt
+            | Self::InvalidCoverage => None,
         }
     }
 }

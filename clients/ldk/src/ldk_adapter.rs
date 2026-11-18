@@ -15,10 +15,12 @@ use lightning::sign::ecdsa::EcdsaChannelSigner;
 use lightning::util::wakers::{Future, Notifier};
 use teos_common::{cryptography, TowerId};
 
+use crate::dbm::CoverageCompletionError;
 use crate::{
-    ClaimClassification, ClientStore, DeliveryBatch, DeliveryCompletion, DeliveryCoordinator,
-    DeliveryEvent, InvalidDeliveryCompletion, PendingAppointment, PreparationError, StorageError,
-    UnclassifiedClaim, VerifiedAppointmentReceipt,
+    ClaimClassification, ClientStore, CoverageOutcome, CoverageRecord, DeliveryBatch,
+    DeliveryCompletion, DeliveryCoordinator, DeliveryEvent, InvalidDeliveryCompletion,
+    PendingAppointment, PreparationError, ProtectionScope, StorageError, UnclassifiedClaim,
+    VerifiedAppointmentReceipt,
 };
 
 type JobId = (ChannelId, Txid);
@@ -45,23 +47,30 @@ struct Shared {
 /// I/O and never calls back into ChainMonitor while its locks are held.
 ///
 /// Keep the associated [`LdkWatchtowerWorker`] running. Only it queues individual
-/// completions, after checking full supplied-claim coverage and durable receipts
-/// from every configured tower. Incomplete commitments remain retained by LDK,
-/// potentially indefinitely. The inbox is in memory; LDK's retained monitor state
-/// supplies snapshots again on restart. Configure the adapter before loading monitors.
+/// completions after the explicitly selected scope is durably fulfilled. Applicable
+/// to_local claims require receipts from every configured tower. Recognized HTLCs
+/// are excluded; unknown or inconsistent claims remain retained by LDK. The inbox
+/// is in memory; LDK's retained monitor state supplies snapshots again on restart.
+/// Configure the adapter before loading monitors.
 #[derive(Clone)]
 pub struct LdkWatchtowerAdapter {
     shared: Arc<Shared>,
     feerate_per_kw: u64,
     destination: ScriptBuf,
+    scope: ProtectionScope,
 }
 impl LdkWatchtowerAdapter {
+    /// Explicit protection scope whose fulfillment authorizes retention release.
+    pub fn protection_scope(&self) -> ProtectionScope {
+        self.scope
+    }
     /// Queues the COMPLETE result of ChannelMonitor::get_pending_justice_txs for a
-    /// channel, unchanged. This supports direct LDK integrations which drive the
+    /// channel, unchanged, using this adapter's configured fee rate and destination.
+    /// This supports direct LDK integrations which drive the
     /// monitor API themselves; the WatchtowerPersist implementation calls it too.
     ///
-    /// Never pass a filtered/subset snapshot: completion concerns the whole supplied
-    /// commitment. New snapshots supersede earlier snapshots and queued completions
+    /// Never pass a filtered/subset snapshot: the scope decision must classify the
+    /// whole commitment. New snapshots supersede earlier snapshots and queued completions
     /// for this channel. Err(()) represents signer unavailability and authorizes no ack.
     pub fn queue_justice_transactions(
         &self,
@@ -166,21 +175,28 @@ impl<S: EcdsaChannelSigner> WatchtowerPersist<S> for LdkWatchtowerAdapter {
 struct ChannelWork {
     version: Arc<()>,
     entries: Vec<JusticeTransactions>,
-    eligible: HashMap<Txid, String>,
+    eligible: HashMap<Txid, CoverageRecord>,
 }
 
 /// Owns storage and delivery coordinators outside LDK's callback locks.
 ///
-/// All configured towers are REQUIRED; empty or duplicate tower sets are rejected.
-/// There is no policy allowing partial claim coverage. The fixed policy requires a
-/// single recognized to_local claim, no HTLC/unknown/missing claims, and a saved
-/// claim spending the same outpoint with the same revocation script and delay.
-/// Fee changes may reuse the original saved payload without weakening this check.
+/// The protection scope is explicit. ToLocalOnly excludes recognized HTLC claims,
+/// records their count durably, and requires every configured tower's receipt for
+/// a generated to_local claim. HTLC-only/empty full snapshots record that no
+/// to_local claim was generated at the configured fee rate and need no receipt.
+/// This may reflect an uneconomical output, rather than an absent output. Once
+/// acknowledged, that commitment cannot be recovered from retention at a lower fee.
+/// Unknown/malformed claims and mismatched saved outpoints/scripts block completion.
+/// Empty or duplicate tower sets are rejected.
+/// Fee changes may reuse the original saved payload for the same outpoint/script.
+/// Scope completion metadata is committed before releasing LDK's whole retention
+/// entry, including excluded HTLC data.
 ///
 /// Poll on adapter.work_available(), new jobs, and next_retry_at(). Drive returned
 /// attempts with bounded concurrency and pass completions to finish(). Failed
-/// preparations remain queued; inspect events and retry polling after storage
-/// repair/backoff. The coordinator deadlines do not schedule preparation failures.
+/// preparations and coverage-completion failures remain queued; inspect events and
+/// retry polling after storage repair/backoff. Coordinator deadlines do not schedule
+/// preparation or coverage-record failures.
 /// No tower registration, job cleanup, or direct ChainMonitor callback occurs here.
 ///
 /// ```no_run
@@ -216,6 +232,7 @@ impl LdkWatchtowerWorker {
     /// Creates a worker and its adapter, without network I/O. Register the persistent
     /// client identity with each tower explicitly before driving delivery.
     pub fn new(
+        scope: ProtectionScope,
         store: ClientStore,
         towers: Vec<DeliveryCoordinator>,
         feerate_per_kw: u64,
@@ -244,6 +261,7 @@ impl LdkWatchtowerWorker {
             }),
             feerate_per_kw,
             destination,
+            scope,
         };
         Ok(Self {
             store,
@@ -251,6 +269,10 @@ impl LdkWatchtowerWorker {
             adapter,
             channels: HashMap::new(),
         })
+    }
+    /// Returns the explicitly selected protection scope.
+    pub fn protection_scope(&self) -> ProtectionScope {
+        self.adapter.scope
     }
     /// Returns a cloneable, Send + Sync handle to install in ChainMonitor.
     pub fn adapter(&self) -> LdkWatchtowerAdapter {
@@ -328,7 +350,8 @@ impl LdkWatchtowerWorker {
     }
 
     /// Saves a network completion in its issuing coordinator, then checks receipts
-    /// from all required towers. Failed saves and incomplete coverage never queue ack.
+    /// from all required towers when applicable. Failed saves or unresolved scope
+    /// decisions never queue ack; recognized HTLC exclusions do not block ToLocalOnly.
     pub fn finish(
         &mut self,
         completion: DeliveryCompletion,
@@ -382,6 +405,9 @@ impl LdkWatchtowerWorker {
                 }
             }
         }
+        let scope = self.adapter.scope;
+        let feerate = self.adapter.feerate_per_kw;
+        let required_towers: Vec<_> = self.towers.keys().copied().collect();
         for (channel_id, work) in &mut self.channels {
             if !self.adapter.current(*channel_id, &work.version) {
                 continue;
@@ -394,21 +420,57 @@ impl LdkWatchtowerWorker {
                             prepared.classification(),
                             prepared.pending_appointment(),
                         );
-                        if coverage.is_complete() {
-                            work.eligible.insert(
-                                commitment_txid,
-                                prepared
-                                    .pending_appointment()
-                                    .unwrap()
-                                    .signature()
-                                    .to_owned(),
-                            );
+                        let signature = if coverage.to_local() {
+                            prepared
+                                .pending_appointment()
+                                .map(PendingAppointment::signature)
+                        } else {
+                            None
+                        };
+                        let observation = CoverageRecord::observation(
+                            (*channel_id, commitment_txid),
+                            scope,
+                            feerate,
+                            &coverage,
+                            signature,
+                            required_towers.clone(),
+                        );
+                        drop(prepared);
+                        match self.store.record_coverage(observation) {
+                            Ok(record) => {
+                                let coverage_id = record.id();
+                                if matches!(
+                                    record.outcome(),
+                                    CoverageOutcome::NoToLocalClaimAtFeeRate
+                                        | CoverageOutcome::NoClaimsAtFeeRate
+                                ) {
+                                    events.push(LdkAdapterEvent::NoApplicableClaimAtFeeRate {
+                                        channel_id: *channel_id,
+                                        commitment_txid,
+                                        feerate_per_kw: feerate,
+                                        outcome: record.outcome(),
+                                        coverage_id,
+                                    });
+                                }
+                                if coverage.satisfies(scope) {
+                                    work.eligible.insert(commitment_txid, record);
+                                }
+                                events.push(LdkAdapterEvent::Coverage {
+                                    channel_id: *channel_id,
+                                    commitment_txid,
+                                    coverage,
+                                    coverage_id,
+                                });
+                            }
+                            Err(error) => {
+                                events.push(LdkAdapterEvent::CoverageStorageFailed {
+                                    channel_id: *channel_id,
+                                    commitment_txid,
+                                    error,
+                                });
+                                work.entries.push(entry);
+                            }
                         }
-                        events.push(LdkAdapterEvent::Coverage {
-                            channel_id: *channel_id,
-                            commitment_txid,
-                            coverage,
-                        });
                     }
                     Err(error) => {
                         let retry = !matches!(error, PreparationError::Classification(_));
@@ -454,45 +516,46 @@ impl LdkWatchtowerWorker {
         if !self.adapter.current(id.0, &work.version) {
             return;
         }
-        let Some(expected_signature) = work.eligible.get(&id.1) else {
+        let Some(record) = work.eligible.get(&id.1) else {
             return;
         };
-        let mut all_saved = true;
-        for tower_id in self.towers.keys() {
-            match self.store.appointment_receipt(*tower_id, id.0, id.1) {
-                Ok(Some(receipt)) if receipt.user_signature() == expected_signature => {}
-                Ok(None) => {
-                    all_saved = false;
-                }
-                result => {
-                    all_saved = false;
-                    let error = match result {
-                        Err(error) => error,
-                        _ => StorageError::InvalidAppointmentReceipt,
-                    };
-                    events.push(LdkAdapterEvent::ReceiptCheckFailed {
+        // Atomically recheck immutable metadata, source payload, and required
+        // receipts, then persist scope completion before queueing LDK's ack.
+        match self.store.complete_coverage(record) {
+            Ok(true) => {
+                if self.adapter.queue_ack(id, &work.version) {
+                    events.push(LdkAdapterEvent::AcknowledgmentQueued {
                         channel_id: id.0,
                         commitment_txid: id.1,
-                        tower_id: *tower_id,
-                        error,
+                        scope: record.scope(),
+                        coverage_id: record.id(),
                     });
                 }
+                work.eligible.remove(&id.1);
             }
-        }
-        if all_saved {
-            if self.adapter.queue_ack(id, &work.version) {
-                events.push(LdkAdapterEvent::AcknowledgmentQueued {
+            Ok(false) => {}
+            Err(CoverageCompletionError::Receipt { tower_id, error }) => {
+                events.push(LdkAdapterEvent::ReceiptCheckFailed {
                     channel_id: id.0,
                     commitment_txid: id.1,
+                    tower_id,
+                    error,
                 });
             }
-            work.eligible.remove(&id.1);
+            Err(CoverageCompletionError::Storage(error)) => {
+                events.push(LdkAdapterEvent::CoverageStorageFailed {
+                    channel_id: id.0,
+                    commitment_txid: id.1,
+                    error,
+                })
+            }
         }
     }
 }
 
 /// Coverage of the currently supplied claims; it does not count channel outputs
-/// LDK omitted as uneconomical. No partial-coverage acknowledgment override exists.
+/// LDK omitted as uneconomical. Full coverage and fulfillment of the explicitly
+/// selected scope are separate facts; excluded HTLCs are never described as protected.
 #[derive(Debug)]
 pub struct ClaimCoverage {
     to_local: bool,
@@ -548,12 +611,22 @@ impl ClaimCoverage {
     pub fn stored_claim_matches(&self) -> bool {
         self.stored_claim_matches
     }
-    /// Whether every supplied claim is covered by the selected, saved to_local payload.
-    pub fn is_complete(&self) -> bool {
-        self.to_local
-            && self.recognized_htlc_claims == 0
-            && self.unclassified.is_empty()
-            && self.stored_claim_matches
+    /// Decision under the selected scope. Unknown claims and saved-claim mismatches
+    /// block completion; recognized HTLC-only and empty results need no appointment.
+    pub fn outcome(&self, scope: ProtectionScope) -> CoverageOutcome {
+        match scope {
+            ProtectionScope::ToLocalOnly => crate::coverage::outcome(
+                self.to_local,
+                self.recognized_htlc_claims,
+                self.unclassified.len(),
+                self.stored_claim_matches,
+            ),
+        }
+    }
+    /// Whether the supplied claims can fulfill this scope, independently of whether
+    /// required receipts and the durable completion record are already saved.
+    pub fn satisfies(&self, scope: ProtectionScope) -> bool {
+        self.outcome(scope) != CoverageOutcome::Blocked
     }
 }
 
@@ -580,13 +653,24 @@ impl fmt::Display for LdkAdapterConfigError {
 impl Error for LdkAdapterConfigError {}
 
 /// Preparation/coverage and delivery diagnostics. Inspect them even when other
-/// commitments succeed. No acknowledgment is inferred from successful partial delivery.
+/// commitments succeed. Acknowledgment means the selected scope was fulfilled;
+/// it does not imply that deliberately excluded HTLC claims are protected.
 #[derive(Debug)]
 pub enum LdkAdapterEvent {
+    /// No to_local claim was generated. This does not establish that no revocable
+    /// output exists: LDK may omit an uneconomical claim at this fee rate.
+    NoApplicableClaimAtFeeRate {
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+        feerate_per_kw: u64,
+        outcome: CoverageOutcome,
+        coverage_id: i64,
+    },
     Coverage {
         channel_id: ChannelId,
         commitment_txid: Txid,
         coverage: ClaimCoverage,
+        coverage_id: i64,
     },
     SignerUnavailable {
         channel_id: ChannelId,
@@ -599,6 +683,11 @@ pub enum LdkAdapterEvent {
         channel_id: ChannelId,
         commitment_txid: Txid,
         error: PreparationError,
+    },
+    CoverageStorageFailed {
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+        error: StorageError,
     },
     CoordinatorFailed {
         tower_id: TowerId,
@@ -617,6 +706,8 @@ pub enum LdkAdapterEvent {
     AcknowledgmentQueued {
         channel_id: ChannelId,
         commitment_txid: Txid,
+        scope: ProtectionScope,
+        coverage_id: i64,
     },
 }
 
