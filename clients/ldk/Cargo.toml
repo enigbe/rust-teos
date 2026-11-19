@@ -24,6 +24,7 @@ teos-common = { path = "../../teos-common" }
 url = "2.5.4"
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 mockito = "0.32.5"
 tempfile = "3.16.0"
 tokio = { version = "1.5", features = ["macros", "rt", "sync", "time"] }

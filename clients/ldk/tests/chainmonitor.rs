@@ -1,7 +1,12 @@
 //! Real LDK nodes and ChainMonitor, with either a mock tower or an opt-in live TEOS.
 
+use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::task::Poll;
 use std::time::{Duration, Instant};
+
+use futures_util::future::poll_fn;
 
 use ldk_watchtower_client::{
     classify_claims, ClientStore, CoverageOutcome, DeliveryAttempt, DeliveryCoordinator,
@@ -26,7 +31,17 @@ use teos_common::{
     receipts::AppointmentReceipt,
 };
 
+#[path = "../examples/embedding.rs"]
+pub mod embedding;
+
 const FEE_RATE: u64 = 1000;
+
+#[derive(Clone, Copy)]
+enum WorkerDriver {
+    Manual,
+    Embedding,
+    EmbeddingRetry,
+}
 
 fn open_worker(path: &Path, tower: TowerConfig, destination: ScriptBuf) -> LdkWatchtowerWorker {
     LdkWatchtowerWorker::new(
@@ -67,6 +82,7 @@ async fn exercise(
     tower: TowerConfig,
     mut mock: Option<(&mut Server, SecretKey)>,
     channel_config: UserConfig,
+    driver: WorkerDriver,
 ) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("client.sqlite");
@@ -148,6 +164,12 @@ async fn exercise(
         .jobs()
         .to_vec();
     let mut mocks = Vec::new();
+    let retry_txid = matches!(driver, WorkerDriver::EmbeddingRetry).then(|| {
+        jobs.iter()
+            .find(|job| job.commitment_txid() != first_txid)
+            .expect("retry test needs an undelivered job after restart")
+            .commitment_txid()
+    });
     if let Some((server, key)) = mock.as_mut() {
         for job in &jobs {
             let mut receipt = AppointmentReceipt::new(job.signature().into(), 100);
@@ -159,16 +181,29 @@ async fn exercise(
                 available_slots: 100,
                 subscription_expiry: 10000,
             };
+            let request = serde_json::to_value(AddAppointmentRequest {
+                appointment: Some(job.appointment().clone().into()),
+                signature: job.signature().into(),
+            })
+            .unwrap();
+            if retry_txid == Some(job.commitment_txid()) {
+                // Matching mocks serve expected hits in creation order: one 503,
+                // then a signed receipt for the exact same saved request.
+                mocks.push(
+                    server
+                        .mock("POST", "/add_appointment")
+                        .match_body(Matcher::Json(request.clone()))
+                        .with_status(503)
+                        .with_body("temporarily unavailable")
+                        .expect(1)
+                        .create_async()
+                        .await,
+                );
+            }
             mocks.push(
                 server
                     .mock("POST", "/add_appointment")
-                    .match_body(Matcher::Json(
-                        serde_json::to_value(AddAppointmentRequest {
-                            appointment: Some(job.appointment().clone().into()),
-                            signature: job.signature().into(),
-                        })
-                        .unwrap(),
-                    ))
+                    .match_body(Matcher::Json(request))
                     .with_status(200)
                     .with_header("content-type", "application/json")
                     .with_body(serde_json::to_string(&response).unwrap())
@@ -218,45 +253,88 @@ async fn exercise(
         keys,
         &restarted_adapter,
     );
-    assert_eq!(
-        chain_monitor.chain_monitor.watch_channel(channel, monitor),
-        Ok(ChannelMonitorUpdateStatus::Completed)
-    );
-    let (attempts, events) = poll(&mut restarted);
-    assert!(attempts
-        .iter()
-        .all(|attempt| attempt.job().commitment_txid() != first_txid));
-    assert_eq!(
-        attempts.len(),
-        jobs.len() - 1,
-        "only jobs without receipts should be resent"
-    );
-    assert!(events.iter().any(|event| matches!(event,
-        LdkAdapterEvent::AcknowledgmentQueued { commitment_txid, .. } if *commitment_txid == first_txid
-    )));
-    for attempt in attempts {
-        let delivered_txid = attempt.job().commitment_txid();
-        let events = restarted
-            .finish(attempt.send().await, Instant::now())
-            .unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, LdkAdapterEvent::AcknowledgmentQueued { commitment_txid, .. }
-                    if *commitment_txid == delivered_txid)),
-            "delivery did not produce an acknowledgment: {events:?}"
+    if !matches!(driver, WorkerDriver::Manual) {
+        let shutdown = async {
+            loop {
+                let _ = chain_monitor.chain_monitor.release_pending_monitor_events();
+                if chain_monitor
+                    .chain_monitor
+                    .get_monitor(channel)
+                    .is_ok_and(|monitor| monitor.pending_justice_commitment_txids().is_empty())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let mut running = Box::pin(embedding::run_worker(
+            &mut restarted,
+            NonZeroUsize::new(2).unwrap(),
+            shutdown,
+        ));
+        // Complete the initial poll before loading the monitor. Only the later
+        // callback can wake snapshot classification and scope acknowledgment.
+        poll_fn(|cx| {
+            assert!(
+                running.as_mut().poll(cx).is_pending(),
+                "worker must wait while the monitor is not loaded"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            chain_monitor.chain_monitor.watch_channel(channel, monitor),
+            Ok(ChannelMonitorUpdateStatus::Completed)
         );
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("worker must handle the new snapshot and any retry deadline");
+    } else {
+        assert_eq!(
+            chain_monitor.chain_monitor.watch_channel(channel, monitor),
+            Ok(ChannelMonitorUpdateStatus::Completed)
+        );
+        let (attempts, events) = poll(&mut restarted);
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.job().commitment_txid() != first_txid));
+        assert_eq!(
+            attempts.len(),
+            jobs.len() - 1,
+            "only jobs without receipts should be resent"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LdkAdapterEvent::AcknowledgmentQueued { commitment_txid, .. }
+                if *commitment_txid == first_txid
+        )));
+        for attempt in attempts {
+            let delivered_txid = attempt.job().commitment_txid();
+            let events = restarted
+                .finish(attempt.send().await, Instant::now())
+                .unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    LdkAdapterEvent::AcknowledgmentQueued { commitment_txid, .. }
+                        if *commitment_txid == delivered_txid
+                )),
+                "delivery did not produce an acknowledgment: {events:?}"
+            );
+        }
     }
     // Use ChainMonitor's normal event-release path, rather than draining the
     // adapter or calling justice_persisted by hand.
-    assert_eq!(
-        chain_monitor
-            .chain_monitor
-            .get_monitor(channel)
-            .unwrap()
-            .pending_justice_commitment_txids(),
-        retained
-    );
+    if matches!(driver, WorkerDriver::Manual) {
+        assert_eq!(
+            chain_monitor
+                .chain_monitor
+                .get_monitor(channel)
+                .unwrap()
+                .pending_justice_commitment_txids(),
+            retained
+        );
+    }
     let _ = chain_monitor.chain_monitor.release_pending_monitor_events();
     assert!(chain_monitor
         .chain_monitor
@@ -305,7 +383,7 @@ async fn exercise(
     }
 }
 
-async fn exercise_with_mock(channel_config: UserConfig) {
+async fn exercise_with_mock(channel_config: UserConfig, driver: WorkerDriver) {
     let mut server = Server::new_async().await;
     let (key, public) = cryptography::get_random_keypair();
     let tower = TowerConfig::new(
@@ -314,17 +392,27 @@ async fn exercise_with_mock(channel_config: UserConfig) {
         Duration::from_secs(5),
     )
     .unwrap();
-    exercise(tower, Some((&mut server, key)), channel_config).await;
+    exercise(tower, Some((&mut server, key)), channel_config, driver).await;
 }
 
 #[tokio::test]
 async fn real_chainmonitor_releases_scoped_commitments_after_delivery_and_restart() {
-    exercise_with_mock(test_legacy_channel_config()).await;
+    exercise_with_mock(test_legacy_channel_config(), WorkerDriver::Manual).await;
 }
 
 #[tokio::test]
 async fn real_anchor_chainmonitor_releases_scoped_commitments_after_delivery_and_restart() {
-    exercise_with_mock(test_default_channel_config()).await;
+    exercise_with_mock(test_default_channel_config(), WorkerDriver::Manual).await;
+}
+
+#[tokio::test]
+async fn embedding_worker_wakes_for_monitor_loaded_after_startup() {
+    exercise_with_mock(test_default_channel_config(), WorkerDriver::Embedding).await;
+}
+
+#[tokio::test]
+async fn embedding_worker_retries_a_temporary_failure_at_its_deadline() {
+    exercise_with_mock(test_default_channel_config(), WorkerDriver::EmbeddingRetry).await;
 }
 
 #[tokio::test]
@@ -339,7 +427,18 @@ async fn live_teos_chainmonitor_delivery_and_restart() {
         Duration::from_secs(10),
     )
     .unwrap();
-    for config in [test_legacy_channel_config(), test_default_channel_config()] {
-        exercise(tower.clone(), None, config).await;
-    }
+    exercise(
+        tower.clone(),
+        None,
+        test_legacy_channel_config(),
+        WorkerDriver::Manual,
+    )
+    .await;
+    exercise(
+        tower,
+        None,
+        test_default_channel_config(),
+        WorkerDriver::Embedding,
+    )
+    .await;
 }
