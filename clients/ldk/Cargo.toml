@@ -6,6 +6,14 @@ description = "An LDK watchtower client for The Eye of Satoshi"
 license = "MIT"
 edition = "2021"
 
+[features]
+# Enables LDK's internal node fixtures; use only when running integration tests.
+integration-tests = ["lightning/_test_utils"]
+
+[[test]]
+name = "chainmonitor"
+required-features = ["integration-tests"]
+
 [dependencies]
 # Pin the published FreeOnlineUser/watchtower-justice-api revision.
 lightning = { git = "https://git.rust-bitcoin.org/lightningdevkit/rust-lightning.git", rev = "f17591b71e8f9c4fe6ce6783513328d060c97e1e", default-features = false, features = ["std"] }

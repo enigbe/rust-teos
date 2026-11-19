@@ -27,8 +27,8 @@ fn commitment_txid() -> Txid {
 
 // Reproduce the pinned API's signed witness formats using LDK's script builders.
 // These are classification fixtures, not an independent check of live monitor
-// output. A real get_pending_justice_txs compatibility test belongs in the
-// real-monitor/regtest integration harness.
+// output. The opt-in chainmonitor integration test checks compatibility with
+// real get_pending_justice_txs output.
 fn signed_claim(
     txid: Txid,
     script: ScriptBuf,

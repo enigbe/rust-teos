@@ -15,10 +15,6 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_REJECTION_MESSAGE_BYTES: usize = 4 * 1024;
 const TRUNCATION_MARKER: &str = " [truncated]";
 
-// TODO: Add an ignored live integration test using an explicitly configured tower
-// URL and ID: register -> prepare -> submit -> reopen -> verify the saved receipt.
-// Document that it consumes tower resources; keep it separate from the mock tests.
-
 /// A tower receipt verified against the exact submitted job, not yet necessarily saved.
 ///
 /// Obtain this from [`TowerClient::send_appointment`], then save it with
