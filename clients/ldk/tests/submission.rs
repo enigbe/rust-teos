@@ -1075,3 +1075,141 @@ async fn sends_to_two_towers_concurrently_while_the_store_remains_available() {
         mock.assert_async().await;
     }
 }
+
+#[tokio::test]
+async fn saved_receipt_remains_verifiable_after_source_job_and_identity_are_removed() {
+    let mut server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let receipt = fixture.receipt(100);
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(fixture.response(&receipt))
+        .expect(1)
+        .create_async()
+        .await;
+    fixture
+        .client(&server.url(), Duration::from_secs(5))
+        .submit_appointment(
+            &mut fixture.store,
+            fixture.job.channel_id(),
+            fixture.job.commitment_txid(),
+        )
+        .await
+        .unwrap();
+    let path = fixture.directory.path().join("client.sqlite");
+    // Simulate future cleanup, not a public cleanup API. Historical receipt
+    // verification needs the tower's public key, not a job or signing secret.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DELETE FROM pending_appointments; DELETE FROM client_identity;")
+        .unwrap();
+    drop(fixture.store);
+    let reopened = ClientStore::open(path).unwrap();
+    let restored = reopened
+        .appointment_receipt(
+            fixture.tower_id,
+            fixture.job.channel_id(),
+            fixture.job.commitment_txid(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored, receipt);
+    assert_eq!(restored.user_signature(), fixture.job.signature());
+    assert!(restored.verify(&fixture.tower_id));
+    assert!(reopened
+        .appointment_receipt(
+            fixture.tower_id,
+            ChannelId([2; 32]),
+            fixture.job.commitment_txid(),
+        )
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .appointment_receipt(
+            fixture.tower_id,
+            fixture.job.channel_id(),
+            Txid::from_byte_array([8; 32]),
+        )
+        .unwrap()
+        .is_none());
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn historical_receipt_verification_does_not_depend_on_source_job_health() {
+    let mut server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let receipt = fixture.receipt(100);
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(fixture.response(&receipt))
+        .expect(1)
+        .create_async()
+        .await;
+    fixture
+        .client(&server.url(), Duration::from_secs(5))
+        .submit_appointment(
+            &mut fixture.store,
+            fixture.job.channel_id(),
+            fixture.job.commitment_txid(),
+        )
+        .await
+        .unwrap();
+    Connection::open(fixture.directory.path().join("client.sqlite"))
+        .unwrap()
+        .execute("UPDATE pending_appointments SET signature='corrupt'", [])
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .pending_appointment(fixture.job.channel_id(), fixture.job.commitment_txid()),
+        Err(StorageError::InvalidPendingAppointment)
+    ));
+    assert_eq!(fixture.saved(), Some(receipt));
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn rejects_tampered_historical_receipts_without_a_source_job() {
+    let mut server = Server::new_async().await;
+    for update in [
+        "UPDATE appointment_receipts SET user_signature='corrupt'",
+        "UPDATE appointment_receipts SET start_block=999",
+        "UPDATE appointment_receipts SET tower_signature='corrupt'",
+    ] {
+        let mut fixture = Fixture::new();
+        let mock = server
+            .mock("POST", "/add_appointment")
+            .with_status(200)
+            .with_body(fixture.response(&fixture.receipt(100)))
+            .expect(1)
+            .create_async()
+            .await;
+        fixture
+            .client(&server.url(), Duration::from_secs(5))
+            .submit_appointment(
+                &mut fixture.store,
+                fixture.job.channel_id(),
+                fixture.job.commitment_txid(),
+            )
+            .await
+            .unwrap();
+        let db = Connection::open(fixture.directory.path().join("client.sqlite")).unwrap();
+        db.execute("DELETE FROM pending_appointments", []).unwrap();
+        db.execute(update, []).unwrap();
+        assert!(
+            matches!(
+                fixture.store.appointment_receipt(
+                    fixture.tower_id,
+                    fixture.job.channel_id(),
+                    fixture.job.commitment_txid(),
+                ),
+                Err(StorageError::InvalidAppointmentReceipt)
+            ),
+            "{update}"
+        );
+        mock.assert_async().await;
+    }
+}

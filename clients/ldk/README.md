@@ -77,6 +77,21 @@ Reuse the same database, sweep configuration, and required tower set on restart.
 The fee rate is fixed for each worker; an already prepared commitment keeps its
 original payload even if a later worker uses a different fee rate.
 
+## Historical receipts
+
+`ClientStore::appointment_receipt` verifies the tower's signature using the stored
+client signature and start block. It remains usable after the pending job or
+client signing key is unavailable. Tower, channel, and full commitment IDs remain
+the local lookup association established when saving against an unchanged job.
+The tower signs the client signature and start block, not those lookup IDs.
+
+A historical receipt identifies the submitted payload by its client signature;
+it does not include the payload bytes or prove that a current job matches it.
+Saving receipts and authorizing acknowledgments still check the expected job.
+This does not enable cleanup yet: safe re-offers must reuse the frozen payload
+or be explicitly rejected, rather than encrypting a changed transaction under
+the same commitment-derived key and fixed nonce.
+
 ## Tests
 
 Run the normal client suite from the workspace root:

@@ -300,28 +300,30 @@ impl PendingAppointmentFailure {
 }
 
 impl ClientStore {
-    /// Loads the latest-starting receipt for this tower and pending job.
+    /// Loads the latest-starting historical receipt for this tower and commitment.
     ///
-    /// Verifies the tower signature and its binding to the saved appointment's
-    /// client signature. Earlier receipts are retained as service evidence.
-    // TODO: Before pending-job cleanup, preserve the appointment association
-    // needed to load and verify receipts after their source jobs are removed.
+    /// Verifies the tower signature over the stored client signature and start
+    /// block, without loading a pending job or the client signing identity.
+    /// Earlier receipts are retained as service evidence.
+    ///
+    /// The channel and commitment IDs are local associations established when
+    /// saving against an unchanged job; the tower does not sign these IDs directly.
+    /// The client signature identifies the submitted payload, whose bytes are not
+    /// included in the receipt. A valid historical receipt does not establish that
+    /// a current job matches it or authorize an LDK acknowledgment. Those paths
+    /// must separately check the expected job and protection scope.
     pub fn appointment_receipt(
         &self,
         tower_id: TowerId,
         channel_id: ChannelId,
         commitment_txid: Txid,
     ) -> Result<Option<AppointmentReceipt>, StorageError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let receipt = find_receipt(&transaction, tower_id, channel_id, commitment_txid)?;
+        let receipt = find_receipt(&self.connection, tower_id, channel_id, commitment_txid)?;
         if let Some(receipt) = &receipt {
-            let job = find_pending(&transaction, channel_id, commitment_txid)?
-                .ok_or(StorageError::InvalidAppointmentReceipt)?;
-            if receipt.user_signature() != job.signature() || !receipt.verify(&tower_id) {
+            if !receipt.verify(&tower_id) {
                 return Err(StorageError::InvalidAppointmentReceipt);
             }
         }
-        transaction.commit()?;
         Ok(receipt)
     }
 
@@ -453,6 +455,9 @@ impl ClientStore {
         Ok(report)
     }
 
+    // TODO: Before cleanup, recover the frozen payload or reject re-offers for
+    // previously delivered commitments. A historical receipt cannot reconstruct
+    // that payload; encrypting changed plaintext would reuse TEOS's key/nonce.
     // Recheck after acquiring the write lock: another connection may have saved
     // this job since the caller's initial read. Build/encrypt only if still absent.
     pub(crate) fn insert_pending_appointment(
@@ -596,7 +601,8 @@ impl ClientStore {
     }
 }
 
-// Decode only; callers verify against their source job within the same transaction.
+// Decode only. Callers verify the tower signature; acknowledgment additionally
+// checks its binding to the expected job within the completion transaction.
 fn find_receipt(
     connection: &Connection,
     tower_id: TowerId,
@@ -822,7 +828,7 @@ pub enum StorageError {
     InvalidRegistration,
     /// A saved appointment is corrupt or belongs to another signing identity.
     InvalidPendingAppointment,
-    /// A stored tower receipt is invalid or does not match its pending job.
+    /// A tower receipt is invalid or does not match the expected submitted payload.
     InvalidAppointmentReceipt,
     /// A coverage observation is corrupt, changed, or incompatible with its policy.
     InvalidCoverage,
