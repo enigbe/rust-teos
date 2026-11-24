@@ -14,8 +14,8 @@ use teos_common::{TowerId, UserId};
 
 use crate::replay::{claim_fingerprint, ReplayResult};
 use crate::{
-    classify_claims, ClaimCoverage, ClientIdentity, CoverageOutcome, CoverageRecord,
-    PendingAppointment, PreparationError, ProtectionScope, ReofferBlockedReason,
+    classify_claims, ClaimCoverage, CleanupOutcome, ClientIdentity, CoverageOutcome,
+    CoverageRecord, PendingAppointment, PreparationError, ProtectionScope, ReofferBlockedReason,
     VerifiedAppointmentReceipt,
 };
 
@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS delivered_appointments (
     commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
     client_signature TEXT NOT NULL,
     claim_fingerprint BLOB NOT NULL CHECK (length(claim_fingerprint) = 32),
+    PRIMARY KEY (channel_id, commitment_txid)
+);
+CREATE TABLE IF NOT EXISTS latest_coverage (
+    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
+    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
+    coverage_id INTEGER,
     PRIMARY KEY (channel_id, commitment_txid)
 );
 CREATE TABLE IF NOT EXISTS coverage_records (
@@ -185,6 +191,13 @@ const SELECT_COVERAGE_FOR_COMMITMENT: &str = "SELECT id, channel_id, commitment_
     feerate_per_kw, to_local, excluded_htlc_claims, unclassified_claims,
     stored_claim_matches, client_signature, required_towers, completion_ready
 FROM coverage_records WHERE channel_id=?1 AND commitment_txid=?2 ORDER BY id";
+
+const SELECT_LATEST_COVERAGE: &str = "SELECT coverage_id FROM latest_coverage
+WHERE channel_id=?1 AND commitment_txid=?2";
+const UPSERT_LATEST_COVERAGE: &str = "INSERT INTO latest_coverage (channel_id, commitment_txid, coverage_id)
+VALUES (?1, ?2, ?3) ON CONFLICT (channel_id, commitment_txid) DO UPDATE SET coverage_id=excluded.coverage_id";
+const DELETE_COMPLETED_APPOINTMENT: &str = "DELETE FROM pending_appointments
+WHERE channel_id=?1 AND commitment_txid=?2";
 
 const COMPLETE_COVERAGE: &str = "UPDATE coverage_records SET completion_ready=1 WHERE id=?1";
 
@@ -534,14 +547,9 @@ impl ClientStore {
         channel_id: ChannelId,
         commitment_txid: Txid,
     ) -> Result<Vec<CoverageRecord>, StorageError> {
-        let mut statement = self.connection.prepare(SELECT_COVERAGE_FOR_COMMITMENT)?;
-        let rows = statement.query_map(
-            params![&channel_id.0[..], &commitment_txid.to_byte_array()[..]],
-            RawCoverage::read,
-        )?;
-        rows.map(|row| row.map_err(StorageError::from)?.validate())
-            .collect()
+        read_coverage_records(&self.connection, channel_id, commitment_txid)
     }
+
     /// Loads one observation by its stable identifier and validates stored metadata.
     pub fn coverage_record(&self, id: i64) -> Result<Option<CoverageRecord>, StorageError> {
         read_coverage(&self.connection, id)
@@ -552,7 +560,11 @@ impl ClientStore {
     ) -> Result<CoverageRecord, StorageError> {
         observation.validate()?;
         if let Some(record) = find_coverage(&self.connection, &observation)? {
-            return Ok(record);
+            if latest_coverage(&self.connection, record.channel_id, record.commitment_txid)?
+                == Some(record.id)
+            {
+                return Ok(record);
+            }
         }
         let transaction = self
             .connection
@@ -601,19 +613,7 @@ impl ClientStore {
             }
         }
         towers.sort_unstable_by_key(TowerId::to_vec);
-        let records = {
-            let mut statement = transaction
-                .prepare(SELECT_COVERAGE_FOR_COMMITMENT)
-                .map_err(StorageError::from)?;
-            let rows = statement
-                .query_map(
-                    params![&channel.0[..], &txid.to_byte_array()[..]],
-                    RawCoverage::read,
-                )
-                .map_err(StorageError::from)?;
-            rows.map(|row| row.map_err(StorageError::from)?.validate())
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let records = read_coverage_records(&transaction, channel, txid)?;
         let completed: Vec<_> = records
             .iter()
             .filter(|record| {
@@ -653,6 +653,103 @@ impl ClientStore {
         }
         transaction.commit().map_err(StorageError::from)?;
         Ok(ReplayResult::Replayed { record, coverage })
+    }
+
+    pub(crate) fn invalidate_cleanup_decision(
+        &mut self,
+        channel: ChannelId,
+        txid: Txid,
+    ) -> Result<(), StorageError> {
+        if latest_coverage(&self.connection, channel, txid)?.is_none() {
+            return Ok(());
+        }
+        self.connection.execute(
+            UPSERT_LATEST_COVERAGE,
+            params![
+                &channel.0[..],
+                &txid.to_byte_array()[..],
+                Option::<i64>::None
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_completed_appointment(
+        &mut self,
+        channel: ChannelId,
+        txid: Txid,
+        scope: ProtectionScope,
+        towers: &[TowerId],
+        unresolved: bool,
+    ) -> Result<CleanupOutcome, StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_pending(&transaction, channel, txid)? {
+            return Ok(CleanupOutcome::AlreadyAbsent);
+        }
+        if unresolved {
+            return Ok(CleanupOutcome::Retained);
+        }
+        let job = find_pending(&transaction, channel, txid)?
+            .ok_or(StorageError::InvalidPendingAppointment)?;
+        let Some(id) = latest_coverage(&transaction, channel, txid)? else {
+            return Ok(CleanupOutcome::Retained);
+        };
+        let current = read_coverage(&transaction, id)?.ok_or(StorageError::InvalidCoverage)?;
+        if current.channel_id != channel || current.commitment_txid != txid {
+            return Err(StorageError::InvalidCoverage);
+        }
+        if current.scope != scope
+            || !current.completion_ready()
+            || current.outcome() == CoverageOutcome::Blocked
+        {
+            return Ok(CleanupOutcome::Retained);
+        }
+        if current
+            .client_signature()
+            .is_some_and(|signature| signature != job.signature())
+        {
+            return Err(StorageError::InvalidCoverage);
+        }
+        let Some((signature, fingerprint)) = delivered_claim(&transaction, channel, txid)? else {
+            return Ok(CleanupOutcome::Retained);
+        };
+        let saved = cryptography::decrypt(&job.appointment().encrypted_blob, &txid)
+            .map_err(|_| StorageError::InvalidPendingAppointment)?;
+        if signature != job.signature()
+            || claim_fingerprint(&saved, job.appointment().to_self_delay) != Some(fingerprint)
+        {
+            return Err(StorageError::InvalidCoverage);
+        }
+        // A no-claim observation can be current, but replay still needs the
+        // original completed to_local observation as delivery evidence.
+        let records = read_coverage_records(&transaction, channel, txid)?;
+        if !records.iter().any(|record| {
+            record.scope() == scope
+                && record.completion_ready()
+                && record.outcome() == CoverageOutcome::ToLocalAppointment
+                && record.client_signature() == Some(job.signature())
+        }) {
+            return Ok(CleanupOutcome::Retained);
+        }
+        for tower in towers {
+            let Some(receipt) = find_receipt(&transaction, *tower, channel, txid)? else {
+                return Ok(CleanupOutcome::Retained);
+            };
+            if receipt.user_signature() != job.signature() || !receipt.verify(tower) {
+                return Err(StorageError::InvalidAppointmentReceipt);
+            }
+        }
+        if transaction.execute(
+            DELETE_COMPLETED_APPOINTMENT,
+            params![&channel.0[..], &txid.to_byte_array()[..]],
+        )? != 1
+        {
+            return Err(StorageError::InvalidPendingAppointment);
+        }
+        transaction.commit()?;
+        Ok(CleanupOutcome::Removed)
     }
 
     // Receipt checks and the durable readiness marker share a transaction. A
@@ -717,6 +814,7 @@ impl ClientStore {
                 )?;
             }
         }
+        set_latest_coverage(&transaction, &record)?;
         if !record.completion_ready {
             transaction.execute(COMPLETE_COVERAGE, [record.id])?;
         }
@@ -778,7 +876,52 @@ fn store_coverage(
                 .ok_or(StorageError::InvalidCoverage)?
         }
     };
+    set_latest_coverage(connection, &record)?;
     Ok(record)
+}
+
+fn latest_coverage(
+    connection: &Connection,
+    channel: ChannelId,
+    txid: Txid,
+) -> Result<Option<i64>, StorageError> {
+    let latest: Option<Option<i64>> = connection
+        .query_row(
+            SELECT_LATEST_COVERAGE,
+            params![&channel.0[..], &txid.to_byte_array()[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(latest.flatten())
+}
+fn set_latest_coverage(
+    connection: &Connection,
+    record: &CoverageRecord,
+) -> Result<(), StorageError> {
+    if latest_coverage(connection, record.channel_id, record.commitment_txid)? != Some(record.id) {
+        connection.execute(
+            UPSERT_LATEST_COVERAGE,
+            params![
+                &record.channel_id.0[..],
+                &record.commitment_txid.to_byte_array()[..],
+                record.id
+            ],
+        )?;
+    }
+    Ok(())
+}
+fn read_coverage_records(
+    connection: &Connection,
+    channel: ChannelId,
+    txid: Txid,
+) -> Result<Vec<CoverageRecord>, StorageError> {
+    let mut statement = connection.prepare(SELECT_COVERAGE_FOR_COMMITMENT)?;
+    let rows = statement.query_map(
+        params![&channel.0[..], &txid.to_byte_array()[..]],
+        RawCoverage::read,
+    )?;
+    rows.map(|row| row.map_err(StorageError::from)?.validate())
+        .collect()
 }
 
 fn has_appointment_history(

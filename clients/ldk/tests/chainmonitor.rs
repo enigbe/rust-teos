@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use futures_util::future::poll_fn;
 
 use ldk_watchtower_client::{
-    classify_claims, ClientStore, CoverageOutcome, DeliveryAttempt, DeliveryCoordinator,
-    LdkAdapterEvent, LdkWatchtowerWorker, ProtectionScope, RetryPolicy, TowerClient, TowerConfig,
+    classify_claims, CleanupOutcome, ClientStore, CoverageOutcome, DeliveryAttempt,
+    DeliveryCoordinator, LdkAdapterEvent, LdkWatchtowerWorker, ProtectionScope, RetryPolicy,
+    TowerClient, TowerConfig,
 };
-use lightning::bitcoin::hashes::Hash;
 use lightning::bitcoin::{secp256k1::SecretKey, ScriptBuf};
 use lightning::chain::channelmonitor::ChannelMonitor;
 use lightning::chain::{BlockLocator, ChannelMonitorUpdateStatus, Watch};
@@ -240,15 +240,15 @@ async fn exercise(
             .pending_justice_commitment_txids(),
         retained
     );
-    // Simulate cleanup after durable scope completion, before LDK consumes ack.
-    // Any replacement INSERT would fail, and the tower mocks forbid resending.
+    // Explicit cleanup is safe before LDK consumes ack. Any replacement INSERT
+    // would fail below, and the tower mocks forbid resending the removed payload.
+    assert_eq!(
+        worker
+            .cleanup_completed_appointment(channel, first_txid)
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
     let database = rusqlite::Connection::open(&path).unwrap();
-    database
-        .execute(
-            "DELETE FROM pending_appointments WHERE channel_id=?1 AND commitment_txid=?2",
-            rusqlite::params![&channel.0[..], &first_txid.to_byte_array()[..]],
-        )
-        .unwrap();
     database.execute_batch("CREATE TRIGGER forbid_reprepare BEFORE INSERT ON pending_appointments BEGIN SELECT RAISE(ABORT, 'must replay completed delivery'); END;").unwrap();
     drop(attempts);
     drop(worker);

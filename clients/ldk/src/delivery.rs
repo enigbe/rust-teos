@@ -496,6 +496,10 @@ impl DeliveryCoordinator {
             }
         }
     }
+    pub(crate) fn has_outstanding_work(&self, channel: ChannelId, txid: Txid) -> bool {
+        self.states.contains_key(&(channel, txid))
+    }
+
     /// Returns the earliest retry or cooldown deadline. Permanent/manual stops and
     /// live attempts have no deadline. Poll again after dropping/cancelling an attempt.
     pub fn next_retry_at(&self) -> Option<Instant> {

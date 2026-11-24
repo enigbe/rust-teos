@@ -6,6 +6,7 @@ use ldk_watchtower_client::{
     LdkWatchtowerAdapter, LdkWatchtowerWorker, PendingAppointment, PreparationError,
     ProtectionScope, ReofferBlockedReason, RetryPolicy, StorageError, TowerClient, TowerConfig,
 };
+use lightning::bitcoin::hashes::Hash;
 use lightning::chain::chainmonitor::WatchtowerPersist;
 use lightning::ln::types::ChannelId;
 use lightning::sign::InMemorySigner as LdkSigner;
@@ -1414,4 +1415,356 @@ async fn replay_allows_an_added_tower_only_with_its_matching_receipt() {
     );
     a.assert_async().await;
     b.assert_async().await;
+}
+
+#[tokio::test]
+async fn cleanup_removes_only_the_completed_job_and_is_idempotent() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let identity = f
+        .worker
+        .store_mut()
+        .load_or_create_identity()
+        .unwrap()
+        .user_id();
+    let records = f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, job.commitment_txid())
+        .unwrap();
+    let receipt = f
+        .worker
+        .store()
+        .appointment_receipt(f.towers[0].0, CHANNEL, job.commitment_txid())
+        .unwrap();
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    let delivered: (String, Vec<u8>) = db
+        .query_row(
+            "SELECT client_signature, claim_fingerprint FROM delivered_appointments",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
+    assert!(f
+        .worker
+        .store()
+        .pending_appointment(CHANNEL, job.commitment_txid())
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        f.worker
+            .store()
+            .coverage_records(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        records
+    );
+    assert_eq!(
+        f.worker
+            .store()
+            .appointment_receipt(f.towers[0].0, CHANNEL, job.commitment_txid())
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT client_signature, claim_fingerprint FROM delivered_appointments",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?))
+        )
+        .unwrap(),
+        delivered
+    );
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::AlreadyAbsent
+    );
+    assert_eq!(
+        f.worker
+            .store_mut()
+            .load_or_create_identity()
+            .unwrap()
+            .user_id(),
+        identity
+    );
+    // LDK has not consumed the first acknowledgment. Cleanup must still leave
+    // enough evidence to reconstruct it after a crash and a new fee rate.
+    f.restart(&[&server.url()], 2000);
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local_with_fee(
+            job.commitment_txid(),
+            144,
+            0,
+            2000,
+        )])]),
+    );
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn cleanup_retains_incomplete_or_blocked_jobs_and_can_follow_a_repaired_offer() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let mut blocked = common::justice(vec![common::to_local(144, 0), common::htlc(true, false)]);
+    blocked.txs.push(common::to_local(144, 2));
+    blocked.txs[2].input[0].witness.clear();
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![blocked]));
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained,
+        "a queued snapshot must be processed first"
+    );
+    f.attempts(Instant::now());
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained
+    );
+    // The repaired observation reuses an older ID. Cleanup must follow the
+    // latest decision, not MAX(id), which still names the blocked observation.
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![
+            common::to_local(144, 0),
+            common::htlc(true, false),
+        ])]),
+    );
+    f.attempts(Instant::now());
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![
+            common::to_local(144, 0),
+            common::to_local(144, 1),
+        ])]),
+    );
+    f.attempts(Instant::now());
+    f.restart(&[&server.url()], 1000);
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained,
+        "a failed classification must invalidate cleanup eligibility durably"
+    );
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![
+            common::to_local(144, 0),
+            common::htlc(true, false),
+        ])]),
+    );
+    f.attempts(Instant::now());
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn cleanup_rechecks_delivery_evidence_and_never_deletes_on_failure() {
+    use ldk_watchtower_client::CleanupOutcome;
+    for case in 0..10 {
+        let mut server = Server::new_async().await;
+        let (mut f, job, mock) = completed_fixture(&mut server).await;
+        let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+        match case {
+            0 => {
+                db.execute("DELETE FROM delivered_appointments", [])
+                    .unwrap();
+            }
+            1 => {
+                db.execute("UPDATE coverage_records SET completion_ready=0", [])
+                    .unwrap();
+            }
+            2 => {
+                db.execute("DELETE FROM appointment_receipts", []).unwrap();
+            }
+            3 => {
+                db.execute(
+                    "UPDATE appointment_receipts SET tower_signature='corrupt'",
+                    [],
+                )
+                .unwrap();
+            }
+            4 => {
+                db.execute(
+                    "UPDATE delivered_appointments SET claim_fingerprint=zeroblob(32)",
+                    [],
+                )
+                .unwrap();
+            }
+            5 => {
+                db.execute("UPDATE pending_appointments SET signature='corrupt'", [])
+                    .unwrap();
+            }
+            6 => {
+                db.execute("UPDATE coverage_records SET client_signature='changed'", [])
+                    .unwrap();
+            }
+            8 => {
+                db.execute("DELETE FROM latest_coverage", []).unwrap();
+            }
+            9 => {
+                db.execute("UPDATE latest_coverage SET coverage_id=-1", [])
+                    .unwrap();
+            }
+            _ => {
+                db.execute_batch("CREATE TRIGGER reject_cleanup AFTER DELETE ON pending_appointments BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;").unwrap();
+            }
+        }
+        let result = f
+            .worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid());
+        if case <= 2 || case == 8 {
+            assert_eq!(result.unwrap(), CleanupOutcome::Retained, "case {case}");
+        } else {
+            assert!(result.is_err(), "case {case}: {result:?}");
+        }
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM pending_appointments", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "case {case}"
+        );
+        if case == 7 {
+            db.execute_batch("DROP TRIGGER reject_cleanup").unwrap();
+            assert_eq!(
+                f.worker
+                    .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+                    .unwrap(),
+                CleanupOutcome::Removed
+            );
+        }
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn cleanup_uses_current_required_towers_and_retains_jobs_still_needed_for_delivery() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut first = Server::new_async().await;
+    let mut second = Server::new_async().await;
+    let (mut f, job, a) = completed_fixture(&mut first).await;
+    let (key, public) = cryptography::get_random_keypair();
+    f.towers.push((teos_common::UserId(public), key));
+    f.restart(&[&first.url(), &second.url()], 1000);
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained
+    );
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local(144, 0)])]),
+    );
+    let (mut attempts, _) = f.attempts(Instant::now());
+    assert_eq!(attempts.len(), 1);
+    let b = second
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&job, 1))
+        .expect(1)
+        .create_async()
+        .await;
+    f.worker
+        .finish(attempts.pop().unwrap().send().await, Instant::now())
+        .unwrap();
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
+    a.assert_async().await;
+    b.assert_async().await;
+}
+
+#[tokio::test]
+async fn cleanup_accepts_a_completed_no_claim_observation_and_preserves_original_delivery() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![common::justice(vec![])]));
+    f.attempts(Instant::now());
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
+    f.restart(&[&server.url()], 1000);
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local(144, 0)])]),
+    );
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn cleanup_waits_for_outstanding_coordinator_state_even_if_a_receipt_was_saved_elsewhere() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    db.execute("DELETE FROM appointment_receipts", []).unwrap();
+    let (attempts, _) = f.attempts(Instant::now());
+    assert_eq!(attempts.len(), 1);
+    let response: AddAppointmentResponse = serde_json::from_str(&f.body(&job, 0)).unwrap();
+    db.execute(
+        "INSERT INTO appointment_receipts VALUES (?1,?2,?3,?4,?5,?6)",
+        rusqlite::params![
+            f.towers[0].0.to_vec(),
+            &CHANNEL.0[..],
+            &job.commitment_txid().to_byte_array()[..],
+            job.signature(),
+            response.start_block,
+            response.signature,
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained
+    );
+    drop(attempts);
+    f.attempts(Instant::now());
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
+    mock.assert_async().await;
 }

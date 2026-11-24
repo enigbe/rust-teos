@@ -228,6 +228,8 @@ pub struct LdkWatchtowerWorker {
     towers: HashMap<TowerId, DeliveryCoordinator>,
     adapter: LdkWatchtowerAdapter,
     channels: HashMap<ChannelId, ChannelWork>,
+    cleanup_blocked: HashSet<JobId>,
+    cleanup_blocked_channels: HashSet<ChannelId>,
 }
 impl LdkWatchtowerWorker {
     /// Creates a worker and its adapter, without network I/O. Register the persistent
@@ -269,6 +271,8 @@ impl LdkWatchtowerWorker {
             towers: configured,
             adapter,
             channels: HashMap::new(),
+            cleanup_blocked: HashSet::new(),
+            cleanup_blocked_channels: HashSet::new(),
         })
     }
     /// Returns the explicitly selected protection scope.
@@ -287,6 +291,45 @@ impl LdkWatchtowerWorker {
     pub fn store_mut(&mut self) -> &mut ClientStore {
         &mut self.store
     }
+    /// Explicitly removes one completed pending payload, preserving replay evidence.
+    /// Call from the worker-owning task after processing snapshots and completions.
+    /// Checks current scope/towers, the latest coverage decision, and immutable
+    /// delivery evidence in the deletion transaction. It performs no network I/O.
+    /// A queued or unresolved offer or outstanding delivery state retains the job.
+    /// No receipt, coverage record, delivery record or signing key is removed.
+    /// LDK need not have consumed its acknowledgment; a later re-offer uses replay.
+    pub fn cleanup_completed_appointment(
+        &mut self,
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+    ) -> Result<crate::CleanupOutcome, StorageError> {
+        let queued = self
+            .adapter
+            .shared
+            .inbox
+            .lock()
+            .unwrap()
+            .snapshots
+            .contains_key(&channel_id);
+        let unresolved = queued
+            || self
+                .cleanup_blocked
+                .contains(&(channel_id, commitment_txid))
+            || self.cleanup_blocked_channels.contains(&channel_id)
+            || self
+                .towers
+                .values()
+                .any(|tower| tower.has_outstanding_work(channel_id, commitment_txid));
+        let towers: Vec<_> = self.towers.keys().copied().collect();
+        self.store.cleanup_completed_appointment(
+            channel_id,
+            commitment_txid,
+            self.adapter.scope,
+            &towers,
+            unresolved,
+        )
+    }
+
     /// Returns the earliest delivery/persistence retry or cooldown deadline.
     pub fn next_retry_at(&self) -> Option<Instant> {
         self.towers
@@ -347,6 +390,7 @@ impl LdkWatchtowerWorker {
             }
         }
         self.check_acknowledgments(&mut events);
+        self.observe_cleanup_decisions(&mut events);
         LdkDeliveryBatch { deliveries, events }
     }
 
@@ -370,7 +414,74 @@ impl LdkWatchtowerWorker {
         // every pending commitment. Poll handles startup/local-save reconciliation.
         self.check_acknowledgment(id, &mut events);
         self.prune_channel(id.0);
+        self.observe_cleanup_decisions(&mut events);
         Ok(events)
+    }
+
+    fn observe_cleanup_decisions(&mut self, events: &mut Vec<LdkAdapterEvent>) {
+        let mut invalidate = HashSet::new();
+        for event in events.iter() {
+            match event {
+                LdkAdapterEvent::Coverage {
+                    channel_id,
+                    commitment_txid,
+                    ..
+                }
+                | LdkAdapterEvent::AcknowledgmentQueued {
+                    channel_id,
+                    commitment_txid,
+                    ..
+                } => {
+                    let id = (*channel_id, *commitment_txid);
+                    self.cleanup_blocked.remove(&id);
+                    invalidate.remove(&id);
+                }
+                LdkAdapterEvent::SignerUnavailable { channel_id } => {
+                    self.cleanup_blocked_channels.insert(*channel_id);
+                }
+                LdkAdapterEvent::PreparationFailed {
+                    channel_id,
+                    commitment_txid,
+                    ..
+                }
+                | LdkAdapterEvent::ReofferBlocked {
+                    channel_id,
+                    commitment_txid,
+                    ..
+                }
+                | LdkAdapterEvent::DuplicateCommitment {
+                    channel_id,
+                    commitment_txid,
+                }
+                | LdkAdapterEvent::CoverageStorageFailed {
+                    channel_id,
+                    commitment_txid,
+                    ..
+                }
+                | LdkAdapterEvent::ReceiptCheckFailed {
+                    channel_id,
+                    commitment_txid,
+                    ..
+                } => {
+                    let id = (*channel_id, *commitment_txid);
+                    self.cleanup_blocked.insert(id);
+                    invalidate.insert(id);
+                }
+                _ => {}
+            }
+        }
+        for (channel_id, commitment_txid) in invalidate {
+            if let Err(error) = self
+                .store
+                .invalidate_cleanup_decision(channel_id, commitment_txid)
+            {
+                events.push(LdkAdapterEvent::CoverageStorageFailed {
+                    channel_id,
+                    commitment_txid,
+                    error,
+                });
+            }
+        }
     }
 
     fn prepare(&mut self, events: &mut Vec<LdkAdapterEvent>) {
@@ -380,6 +491,7 @@ impl LdkWatchtowerWorker {
             match snapshot.transactions {
                 Err(()) => events.push(LdkAdapterEvent::SignerUnavailable { channel_id }),
                 Ok(mut entries) => {
+                    self.cleanup_blocked_channels.remove(&channel_id);
                     let mut seen = HashSet::new();
                     let duplicates: HashSet<_> = entries
                         .iter()

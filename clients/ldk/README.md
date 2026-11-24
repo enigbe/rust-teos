@@ -126,9 +126,47 @@ migration.
 
 Deliveries predating the delivery-record table acquire records when a valid
 pending payload is next processed; missing payloads without such a record block.
-Preserve receipts, coverage observations and delivery records. Future cleanup
-must only remove jobs with a delivery record. No deletion API is exposed yet;
-general schema versioning and automatic cleanup remain follow-ups.
+Receipts, coverage observations and delivery records remain available after
+pending-job cleanup. General schema versioning and historical evidence retention
+remain follow-ups.
+
+## Explicit cleanup
+
+Call `worker.cleanup_completed_appointment(channel_id, commitment_txid)` from the
+worker-owning task, after processing queued snapshots and network completions.
+The operation makes no network request and never runs from LDK's callback. It is
+explicit and handles one job at a time; the embedding loop does not invoke it
+automatically. An administrative command branch in that loop can call it.
+
+The result is one of:
+
+- `CleanupOutcome::Removed`: the completed pending payload was deleted.
+- `CleanupOutcome::AlreadyAbsent`: no pending job exists; retrying cleanup is safe.
+- `CleanupOutcome::Retained`: evidence or the current decision is incomplete, or
+  the worker still has unresolved snapshots, signer failures, or delivery state.
+  Inspect the existing coverage/delivery events and drive the worker before retrying.
+
+If validation detects corrupt or mismatched evidence, or SQLite fails, the
+operation returns `StorageError` without deleting the job. The checks and deletion
+share an immediate transaction: the pending job must validate, its signature and claim fingerprint must match the
+delivery record, the latest coverage decision must be complete in the current
+scope, and every currently required tower must have a valid receipt for that
+payload. A latest no-claim observation is allowed only when the original completed
+`to_local` observation remains available as replay evidence.
+
+The additive `latest_coverage` table records the most recently observed coverage
+ID, including when an older deduplicated observation is reused. IDs alone do not
+establish observation order. Failed offers invalidate the decision; unresolved
+worker errors also prevent cleanup. Existing jobs without a tracked current
+decision are retained until a valid observation is processed. Cleanup does not
+infer eligibility from an older successful observation or from receipt existence.
+
+Only the selected row in `pending_appointments` is removed. The signing identity,
+receipts, delivery record, coverage history and current decision remain intact.
+Cleanup neither queues an acknowledgment nor requires LDK to have consumed one:
+if a crash re-offers the commitment, replay rechecks the evidence without creating
+or sending another payload. Closed-channel evidence deletion and batch cleanup scheduling
+are separate operations and are not implemented here.
 
 ## Tests
 
@@ -157,7 +195,8 @@ tower with signed receipts. Each test:
 - Opens a channel and makes payments that revoke both HTLC-free and
   HTLC-bearing commitments, using LDK-generated justice transactions.
 - Delivers a commitment containing both to_local and HTLC claims first, saves
-  its receipt, removes that completed pending payload to simulate cleanup, and
+  its receipt, removes that completed pending payload through the public cleanup
+  API, and
   restarts at a different justice fee before LDK consumes the acknowledgment.
 - Reloads the serialized channel monitor into a fresh `ChainMonitor` and reopens
   the client database. The saved receipt satisfies delivery without another
