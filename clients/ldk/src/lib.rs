@@ -24,6 +24,7 @@ mod identity;
 mod ldk_adapter;
 mod registration;
 mod replay;
+mod schema;
 mod submission;
 
 pub use appointments::{AppointmentPreparation, PendingAppointment, PreparationError};

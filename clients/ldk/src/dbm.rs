@@ -38,73 +38,6 @@ impl From<rusqlite::Error> for CoverageCompletionError {
     }
 }
 
-// TODO: Before the LDK client's first release, add schema versioning and
-// transactional migrations in a separate follow-up. CREATE TABLE IF NOT EXISTS
-// does not upgrade existing table definitions.
-const CREATE_TABLES: &str = "CREATE TABLE IF NOT EXISTS client_identity (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    secret_key BLOB NOT NULL CHECK (length(secret_key) = 32)
-);
-CREATE TABLE IF NOT EXISTS registrations (
-    tower_id BLOB NOT NULL,
-    user_id BLOB NOT NULL,
-    available_slots INTEGER NOT NULL,
-    subscription_start INTEGER NOT NULL,
-    subscription_expiry INTEGER NOT NULL,
-    signature TEXT NOT NULL,
-    PRIMARY KEY (tower_id, user_id, subscription_expiry)
-);
-CREATE TABLE IF NOT EXISTS pending_appointments (
-    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
-    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
-    user_id BLOB NOT NULL CHECK (length(user_id) = 33),
-    locator BLOB NOT NULL CHECK (length(locator) = 16),
-    encrypted_blob BLOB NOT NULL,
-    to_self_delay INTEGER NOT NULL,
-    signature TEXT NOT NULL,
-    PRIMARY KEY (channel_id, commitment_txid)
-);
-CREATE TABLE IF NOT EXISTS appointment_receipts (
-    tower_id BLOB NOT NULL,
-    channel_id BLOB NOT NULL,
-    commitment_txid BLOB NOT NULL,
-    user_signature TEXT NOT NULL,
-    start_block INTEGER NOT NULL,
-    tower_signature TEXT NOT NULL,
-    PRIMARY KEY (tower_id, channel_id, commitment_txid, start_block)
-);
-CREATE INDEX IF NOT EXISTS appointment_receipts_by_commitment
-    ON appointment_receipts (channel_id, commitment_txid);
-CREATE TABLE IF NOT EXISTS delivered_appointments (
-    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
-    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
-    client_signature TEXT NOT NULL,
-    claim_fingerprint BLOB NOT NULL CHECK (length(claim_fingerprint) = 32),
-    PRIMARY KEY (channel_id, commitment_txid)
-);
-CREATE TABLE IF NOT EXISTS latest_coverage (
-    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
-    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
-    coverage_id INTEGER,
-    PRIMARY KEY (channel_id, commitment_txid)
-);
-CREATE TABLE IF NOT EXISTS coverage_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
-    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
-    scope INTEGER NOT NULL,
-    feerate_per_kw INTEGER NOT NULL CHECK (feerate_per_kw > 0),
-    to_local INTEGER NOT NULL CHECK (to_local IN (0, 1)),
-    excluded_htlc_claims INTEGER NOT NULL CHECK (excluded_htlc_claims >= 0),
-    unclassified_claims INTEGER NOT NULL CHECK (unclassified_claims >= 0),
-    stored_claim_matches INTEGER NOT NULL CHECK (stored_claim_matches IN (0, 1)),
-    client_signature TEXT NOT NULL,
-    required_towers BLOB NOT NULL,
-    completion_ready INTEGER NOT NULL DEFAULT 0 CHECK (completion_ready IN (0, 1)),
-    UNIQUE (channel_id, commitment_txid, scope, feerate_per_kw, to_local,
-        excluded_htlc_claims, unclassified_claims, stored_claim_matches, client_signature, required_towers)
-);";
-
 const SELECT_REGISTRATION: &str =
     "SELECT available_slots, subscription_start, subscription_expiry, signature
 FROM registrations WHERE tower_id=?1 AND user_id=?2
@@ -217,13 +150,16 @@ pub struct ClientStore {
 }
 
 impl ClientStore {
-    /// Opens or creates a client database and initializes its tables.
+    /// Opens or creates a client database and applies supported schema migrations.
+    /// Existing unversioned databases must match the known complete client layout.
+    /// Migrations and their version marker commit atomically. Unsupported versions
+    /// and unknown or damaged layouts are rejected without recreating tables.
     ///
     /// The parent directory must already exist. No identity is generated until
     /// an operation needs to sign a registration or appointment.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let connection = Connection::open(path)?;
-        connection.execute_batch(CREATE_TABLES)?;
+        let mut connection = Connection::open(path)?;
+        crate::schema::initialize(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -1166,6 +1102,10 @@ fn load_or_create_identity(connection: &Connection) -> Result<ClientIdentity, St
 pub enum StorageError {
     /// SQLite could not complete a storage operation.
     Sqlite(rusqlite::Error),
+    /// The database version is invalid or newer than this client understands.
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
+    /// The database does not match a supported client schema.
+    InvalidSchema,
     /// The stored signing key has an invalid length or scalar value.
     InvalidIdentity,
     /// A stored registration receipt has invalid subscription data or a bad signature.
@@ -1190,6 +1130,9 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sqlite(error) => write!(f, "Client storage error: {error}"),
+            Self::UnsupportedSchemaVersion { found, supported } => write!(f,
+                "Unsupported client schema version {found}; this client supports versions through {supported}"),
+            Self::InvalidSchema => write!(f, "Database layout does not match a supported LDK client schema"),
             Self::InvalidIdentity => write!(f, "Stored client signing key is invalid"),
             Self::InvalidRegistration => write!(f, "Stored tower registration is invalid"),
             Self::InvalidPendingAppointment => write!(f, "Stored pending appointment is invalid"),
@@ -1207,7 +1150,9 @@ impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
-            Self::InvalidIdentity
+            Self::UnsupportedSchemaVersion { .. }
+            | Self::InvalidSchema
+            | Self::InvalidIdentity
             | Self::InvalidRegistration
             | Self::InvalidPendingAppointment
             | Self::InvalidAppointmentReceipt

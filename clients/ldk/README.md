@@ -79,6 +79,38 @@ required tower still needs a matching receipt when replaying completed delivery.
 The fee rate is fixed for each worker; an already prepared commitment keeps its
 original payload even if a later worker uses a different fee rate.
 
+## Database versions and migrations
+
+The dedicated client database uses SQLite's `PRAGMA user_version`. The current
+schema version is 1. `ClientStore::open` initializes or upgrades the schema before
+returning; it does not generate a signing identity during initialization.
+
+An empty database is initialized atomically. The known complete unversioned client
+layout is adopted as version 1 without rewriting rows, re-signing payloads, or
+changing coverage IDs and autoincrement state. Partial or unrelated unversioned
+layouts are rejected rather than completed by guessing which tables are missing.
+Migration does not infer a cleanup decision from old coverage observations.
+
+Unsupported versions return `StorageError::UnsupportedSchemaVersion`. A layout
+which does not match the supported client schema returns `StorageError::InvalidSchema`,
+including missing tables, changed definitions, or an incompatible required index.
+These failures do not initialize or repair the existing database. Additional
+indexes and triggers on the client's own tables are preserved; required definitions
+must still match the frozen schema.
+
+The baseline is frozen in `src/migrations/001_initial.sql`. Future changes append
+ordered migrations to the schema module instead of editing previously supported
+versions. Migration SQL must not manage its own transactions. All pending steps,
+including their version markers, run in one immediate transaction: a failure
+rolls the entire upgrade back, so it can be retried after the cause is resolved.
+Concurrent openers recheck the version after acquiring the write lock. Already
+current databases are checked using a read transaction without a write lock.
+
+Initialize storage before loading monitors or starting the worker, as in the
+embedding example. Do not keep older client processes running against a database
+being upgraded by a newer client. The version-1 baseline preserves the existing
+appointment and claim fingerprint formats.
+
 ## Historical receipts
 
 `ClientStore::appointment_receipt` verifies the tower's signature using the stored
@@ -127,8 +159,7 @@ migration.
 Deliveries predating the delivery-record table acquire records when a valid
 pending payload is next processed; missing payloads without such a record block.
 Receipts, coverage observations and delivery records remain available after
-pending-job cleanup. General schema versioning and historical evidence retention
-remain follow-ups.
+pending-job cleanup. Historical evidence retention remains a follow-up.
 
 ## Explicit cleanup
 

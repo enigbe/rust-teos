@@ -1583,6 +1583,79 @@ async fn cleanup_retains_incomplete_or_blocked_jobs_and_can_follow_a_repaired_of
 }
 
 #[tokio::test]
+async fn cleanup_retains_a_job_when_a_previous_blocked_observation_becomes_current_again() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    completed(&f.adapter);
+
+    let valid = common::justice(vec![common::to_local(144, 0), common::htlc(true, false)]);
+    let mut blocked = valid.clone();
+    let mut unknown = common::to_local(144, 2);
+    unknown.input[0].witness.clear();
+    blocked.txs.push(unknown);
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![blocked.clone()]));
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert!(completed(&f.adapter).is_empty());
+    let records = f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, job.commitment_txid())
+        .unwrap();
+    assert!(records
+        .iter()
+        .any(|record| record.outcome() == CoverageOutcome::Blocked));
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained
+    );
+
+    // The repaired offer is already delivered, so it becomes completed without
+    // another request. Keep the payload for the next observation.
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![valid]));
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    let repaired = f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, job.commitment_txid())
+        .unwrap();
+    assert_eq!(repaired, records, "repair reuses the completed observation");
+
+    // This is the exact same blocked observation as before. No new row is
+    // inserted, but it must replace the completed decision as the latest one.
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![blocked]));
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert!(completed(&f.adapter).is_empty());
+    assert_eq!(
+        f.worker
+            .store()
+            .coverage_records(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        repaired,
+        "the repeated blocked observation must reuse its existing row"
+    );
+    f.restart(&[&server.url()], 1000);
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Retained,
+        "the latest blocked decision must survive reopening"
+    );
+    assert_eq!(f.job(), job);
+    mock.assert_async().await;
+}
+
+#[tokio::test]
 async fn cleanup_rechecks_delivery_evidence_and_never_deletes_on_failure() {
     use ldk_watchtower_client::CleanupOutcome;
     for case in 0..10 {
@@ -1765,6 +1838,58 @@ async fn cleanup_waits_for_outstanding_coordinator_state_even_if_a_receipt_was_s
             .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
             .unwrap(),
         CleanupOutcome::Removed
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn adopting_an_unversioned_database_preserves_valid_delivery_cleanup_and_replay() {
+    use ldk_watchtower_client::CleanupOutcome;
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let records = f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, job.commitment_txid())
+        .unwrap();
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    // The unversioned baseline has identical DDL and signed data. Clear only the
+    // marker to exercise adoption with valid, operational delivery evidence.
+    db.pragma_update(None, "user_version", 0).unwrap();
+    f.restart(&[&server.url()], 1000);
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.job(), job);
+    assert_eq!(
+        f.worker
+            .store()
+            .coverage_records(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        records
+    );
+    assert_eq!(
+        f.worker
+            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        CleanupOutcome::Removed
+    );
+    f.restart(&[&server.url()], 2000);
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local_with_fee(
+            job.commitment_txid(),
+            144,
+            0,
+            2000,
+        )])]),
+    );
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
     );
     mock.assert_async().await;
 }
