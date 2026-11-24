@@ -15,15 +15,19 @@ It requires no `integration-tests` feature:
 cargo check -p ldk-watchtower-client --locked --example embedding
 ```
 
-The application supplies a persistent database path, tower identities and HTTP
-URLs, request timeouts, a justice fee rate in sat/kw, and its sweep destination
-script. `Settings` also requires an explicit `ProtectionScope::ToLocalOnly` and
-registration action. The helper validates the worker configuration before making
-registration requests.
+During configuration, save each tower's identity, HTTP URL and request timeout
+with `ClientStore::save_tower`. For startup, supply the same database path and an
+explicit list of saved IDs in `Settings::required_towers`, together with the
+justice fee rate in sat/kw, sweep destination script,
+`ProtectionScope::ToLocalOnly`, and registration action. The helper loads only
+those selected entries; it does not activate every tower in the registry.
 
 Use this startup order:
 
-1. Call `open_watchtower(settings)`. Choose `RegisterOrRenew` only for an explicit
+1. Call `open_watchtower(settings)`. All selected settings and the worker
+   configuration are validated before creating an identity or registering.
+   Missing or corrupt selected entries fail startup; other registry entries do
+   not affect this selection. Choose `RegisterOrRenew` only for an explicit
    registration or renewal operation. Routine startup uses `UseSavedReceipts`,
    which loads and verifies registration evidence from the same database. An old
    receipt does not establish that the subscription is still active: compare its
@@ -93,11 +97,13 @@ create a client identity, or change registration receipts and appointments.
 Registration remains an explicit `TowerClient::register` operation. A saved entry
 does not establish that a tower has registered the user or protects any commitment.
 
-An application can load saved settings into the embedding example's
-`Settings::towers`, choosing which entries its worker requires. Saving or updating
-an entry does not reconfigure an existing worker. Loading validates the public
-key, URL, and nonzero timeout again; invalid entries return an error instead of
-being silently omitted from the required tower set.
+The embedding example loads the IDs in `Settings::required_towers` from this
+registry. Saving or updating an entry does not reconfigure an existing worker;
+reopening the worker loads the current connection settings for the selected IDs.
+Loading validates the public key, URL, and nonzero timeout again; invalid selected
+entries return an error instead of being silently omitted from the required tower
+set. Reopening with `UseSavedReceipts` does not register again, even if an endpoint
+or timeout changed. Choose renewal explicitly when it is needed.
 
 ## Database versions and migrations
 

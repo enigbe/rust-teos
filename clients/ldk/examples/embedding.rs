@@ -13,7 +13,7 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use ldk_watchtower_client::{
     ClientStore, CoverageOutcome, DeliveryCoordinator, DeliveryEvent, DeliveryStatus,
     LdkAdapterEvent, LdkWatchtowerAdapter, LdkWatchtowerWorker, ProtectionScope, RetryPolicy,
-    TowerClient, TowerConfig,
+    TowerClient,
 };
 use lightning::bitcoin::ScriptBuf;
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
@@ -22,6 +22,7 @@ use lightning::chain::Filter;
 use lightning::sign::ecdsa::EcdsaChannelSigner;
 use lightning::sign::{EntropySource, PeerStorageKey};
 use lightning::util::logger::Logger;
+use teos_common::TowerId;
 
 /// Select this through an explicit application command, not a retry loop.
 pub enum RegistrationAction {
@@ -31,7 +32,9 @@ pub enum RegistrationAction {
 
 pub struct Settings {
     pub database: PathBuf,
-    pub towers: Vec<TowerConfig>,
+    /// Explicit IDs of saved towers required by this worker. Unselected registry
+    /// entries are not activated or contacted.
+    pub required_towers: Vec<TowerId>,
     pub registration: RegistrationAction,
     pub scope: ProtectionScope,
     pub feerate_per_kw: u64,
@@ -40,13 +43,19 @@ pub struct Settings {
 
 /// Reopen the same database on restart. Registration failures are returned to the
 /// caller: a lost response or failed save must not cause blind registration retries.
+/// Save each tower's connection settings through ClientStore::save_tower before
+/// startup. All selected entries and worker settings are validated before identity
+/// creation or any registration request.
 pub async fn open_watchtower(settings: Settings) -> Result<LdkWatchtowerWorker, Box<dyn Error>> {
+    let store = ClientStore::open(settings.database)?;
     let clients = settings
-        .towers
+        .required_towers
         .into_iter()
-        .map(|config| {
-            let id = config.tower_id();
-            TowerClient::new(config).map(|client| (id, client))
+        .map(|id| -> Result<_, Box<dyn Error>> {
+            let config = store.tower(id)?.ok_or_else(|| {
+                format!("No saved connection settings for tower {id}; save a TowerConfig before startup")
+            })?;
+            Ok((id, TowerClient::new(config)?))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let towers = clients
@@ -61,7 +70,7 @@ pub async fn open_watchtower(settings: Settings) -> Result<LdkWatchtowerWorker, 
         .collect();
     let mut worker = LdkWatchtowerWorker::new(
         settings.scope,
-        ClientStore::open(settings.database)?,
+        store,
         towers,
         settings.feerate_per_kw,
         settings.destination,
