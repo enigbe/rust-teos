@@ -12,6 +12,7 @@ use ldk_watchtower_client::{
     classify_claims, ClientStore, CoverageOutcome, DeliveryAttempt, DeliveryCoordinator,
     LdkAdapterEvent, LdkWatchtowerWorker, ProtectionScope, RetryPolicy, TowerClient, TowerConfig,
 };
+use lightning::bitcoin::hashes::Hash;
 use lightning::bitcoin::{secp256k1::SecretKey, ScriptBuf};
 use lightning::chain::channelmonitor::ChannelMonitor;
 use lightning::chain::{BlockLocator, ChannelMonitorUpdateStatus, Watch};
@@ -35,6 +36,7 @@ use teos_common::{
 pub mod embedding;
 
 const FEE_RATE: u64 = 1000;
+const RESTART_FEE_RATE: u64 = 2000;
 
 #[derive(Clone, Copy)]
 enum WorkerDriver {
@@ -43,7 +45,12 @@ enum WorkerDriver {
     EmbeddingRetry,
 }
 
-fn open_worker(path: &Path, tower: TowerConfig, destination: ScriptBuf) -> LdkWatchtowerWorker {
+fn open_worker(
+    path: &Path,
+    tower: TowerConfig,
+    destination: ScriptBuf,
+    fee: u64,
+) -> LdkWatchtowerWorker {
     LdkWatchtowerWorker::new(
         ProtectionScope::ToLocalOnly,
         ClientStore::open(path).unwrap(),
@@ -52,7 +59,7 @@ fn open_worker(path: &Path, tower: TowerConfig, destination: ScriptBuf) -> LdkWa
             RetryPolicy::default(),
             RetryPolicy::default(),
         )],
-        FEE_RATE,
+        fee,
         destination,
     )
     .unwrap()
@@ -89,7 +96,7 @@ async fn exercise(
     let chanmon_cfgs = create_chanmon_cfgs(2);
     let cfg = &chanmon_cfgs[1];
     let destination = cfg.keys_manager.get_destination_script([0; 32]).unwrap();
-    let mut worker = open_worker(&path, tower.clone(), destination.clone());
+    let mut worker = open_worker(&path, tower.clone(), destination.clone(), FEE_RATE);
     if mock.is_none() {
         TowerClient::new(tower.clone())
             .unwrap()
@@ -233,10 +240,20 @@ async fn exercise(
             .pending_justice_commitment_txids(),
         retained
     );
+    // Simulate cleanup after durable scope completion, before LDK consumes ack.
+    // Any replacement INSERT would fail, and the tower mocks forbid resending.
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute(
+            "DELETE FROM pending_appointments WHERE channel_id=?1 AND commitment_txid=?2",
+            rusqlite::params![&channel.0[..], &first_txid.to_byte_array()[..]],
+        )
+        .unwrap();
+    database.execute_batch("CREATE TRIGGER forbid_reprepare BEFORE INSERT ON pending_appointments BEGIN SELECT RAISE(ABORT, 'must replay completed delivery'); END;").unwrap();
     drop(attempts);
     drop(worker);
 
-    let mut restarted = open_worker(&path, tower.clone(), destination.clone());
+    let mut restarted = open_worker(&path, tower.clone(), destination.clone(), RESTART_FEE_RATE);
     let restarted_adapter = restarted.adapter();
     let keys = &cfg.keys_manager;
     let mut bytes = &snapshot[..];
@@ -347,12 +364,19 @@ async fn exercise(
     for job in &jobs {
         let restored = reopened
             .pending_appointment(channel, job.commitment_txid())
-            .unwrap()
             .unwrap();
-        assert_eq!(
-            &restored, job,
-            "restart must preserve the exact encrypted and signed payload"
-        );
+        if job.commitment_txid() == first_txid {
+            assert!(
+                restored.is_none(),
+                "completed payload must not be recreated"
+            );
+        } else {
+            assert_eq!(
+                restored.as_ref(),
+                Some(job),
+                "restart must preserve the exact encrypted and signed payload"
+            );
+        }
         assert!(reopened
             .appointment_receipt(tower.tower_id(), channel, job.commitment_txid())
             .unwrap()
@@ -362,7 +386,14 @@ async fn exercise(
     for txid in retained {
         let records = reopened.coverage_records(channel, txid).unwrap();
         assert!(!records.is_empty());
-        assert!(records.iter().all(|record| record.completion_ready()));
+        // Earlier observations may still be incomplete: the current snapshot
+        // must have its own completed observation at the restarted fee rate.
+        assert!(
+            records
+                .iter()
+                .any(|record| record.completion_ready()
+                    && record.feerate_per_kw() == RESTART_FEE_RATE)
+        );
         assert!(records
             .iter()
             .all(|record| record.outcome() != CoverageOutcome::Blocked));

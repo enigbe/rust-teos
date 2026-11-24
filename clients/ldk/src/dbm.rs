@@ -12,9 +12,11 @@ use teos_common::{
 };
 use teos_common::{TowerId, UserId};
 
+use crate::replay::{claim_fingerprint, ReplayResult};
 use crate::{
-    ClientIdentity, CoverageOutcome, CoverageRecord, PendingAppointment, PreparationError,
-    ProtectionScope, VerifiedAppointmentReceipt,
+    classify_claims, ClaimCoverage, ClientIdentity, CoverageOutcome, CoverageRecord,
+    PendingAppointment, PreparationError, ProtectionScope, ReofferBlockedReason,
+    VerifiedAppointmentReceipt,
 };
 
 /// Identifies receipt failures without repeating verification outside the transaction.
@@ -70,6 +72,15 @@ CREATE TABLE IF NOT EXISTS appointment_receipts (
     start_block INTEGER NOT NULL,
     tower_signature TEXT NOT NULL,
     PRIMARY KEY (tower_id, channel_id, commitment_txid, start_block)
+);
+CREATE INDEX IF NOT EXISTS appointment_receipts_by_commitment
+    ON appointment_receipts (channel_id, commitment_txid);
+CREATE TABLE IF NOT EXISTS delivered_appointments (
+    channel_id BLOB NOT NULL CHECK (length(channel_id) = 32),
+    commitment_txid BLOB NOT NULL CHECK (length(commitment_txid) = 32),
+    client_signature TEXT NOT NULL,
+    claim_fingerprint BLOB NOT NULL CHECK (length(claim_fingerprint) = 32),
+    PRIMARY KEY (channel_id, commitment_txid)
 );
 CREATE TABLE IF NOT EXISTS coverage_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +147,22 @@ ON CONFLICT (tower_id, channel_id, commitment_txid, start_block) DO UPDATE SET
 const SELECT_APPOINTMENT_RECEIPT: &str = "SELECT user_signature, start_block, tower_signature
 FROM appointment_receipts WHERE tower_id=?1 AND channel_id=?2 AND commitment_txid=?3
 ORDER BY start_block DESC LIMIT 1";
+
+const SELECT_DELIVERED_APPOINTMENT: &str = "SELECT client_signature, claim_fingerprint
+FROM delivered_appointments WHERE channel_id=?1 AND commitment_txid=?2";
+const INSERT_DELIVERED_APPOINTMENT: &str = "INSERT INTO delivered_appointments
+    (channel_id, commitment_txid, client_signature, claim_fingerprint)
+VALUES (?1, ?2, ?3, ?4) ON CONFLICT (channel_id, commitment_txid) DO NOTHING";
+const HAS_PENDING_APPOINTMENT: &str = "SELECT EXISTS (
+    SELECT 1 FROM pending_appointments WHERE channel_id=?1 AND commitment_txid=?2
+)";
+const HAS_APPOINTMENT_HISTORY: &str = "SELECT EXISTS (
+    SELECT 1 FROM delivered_appointments WHERE channel_id=?1 AND commitment_txid=?2
+    UNION ALL
+    SELECT 1 FROM appointment_receipts WHERE channel_id=?1 AND commitment_txid=?2
+    UNION ALL
+    SELECT 1 FROM coverage_records WHERE channel_id=?1 AND commitment_txid=?2 AND client_signature!=''
+)";
 
 const INSERT_COVERAGE: &str = "INSERT INTO coverage_records
     (channel_id, commitment_txid, scope, feerate_per_kw, to_local, excluded_htlc_claims,
@@ -455,9 +482,8 @@ impl ClientStore {
         Ok(report)
     }
 
-    // TODO: Before cleanup, recover the frozen payload or reject re-offers for
-    // previously delivered commitments. A historical receipt cannot reconstruct
-    // that payload; encrypting changed plaintext would reuse TEOS's key/nonce.
+    // Missing payloads with delivery history must take the replay path. Never
+    // invoke the encrypting builder for them, including concurrent callers.
     // Recheck after acquiring the write lock: another connection may have saved
     // this job since the caller's initial read. Build/encrypt only if still absent.
     pub(crate) fn insert_pending_appointment(
@@ -473,6 +499,9 @@ impl ClientStore {
         let pending = match find_pending(&transaction, channel_id, commitment_txid)? {
             Some(pending) => pending,
             None => {
+                if has_appointment_history(&transaction, channel_id, commitment_txid)? {
+                    return Err(StorageError::DeliveryHistoryRequiresReplay.into());
+                }
                 let identity = load_or_create_identity(&transaction)?;
                 let job = build(&identity)?;
                 transaction
@@ -528,31 +557,104 @@ impl ClientStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let record = match find_coverage(&transaction, &observation)? {
-            Some(record) => record,
-            None => {
-                transaction.execute(
-                    INSERT_COVERAGE,
-                    params![
-                        &observation.channel_id.0[..],
-                        &observation.commitment_txid.to_byte_array()[..],
-                        observation.scope.id(),
-                        observation.feerate_per_kw,
-                        observation.to_local,
-                        observation.excluded_htlc_claims,
-                        observation.unclassified_claims,
-                        observation.stored_claim_matches,
-                        observation.client_signature.as_deref().unwrap_or(""),
-                        tower_bytes(&observation.required_towers),
-                    ],
-                )?;
-                read_coverage(&transaction, transaction.last_insert_rowid())?
-                    .ok_or(StorageError::InvalidCoverage)?
-            }
-        };
+        let record = store_coverage(&transaction, &observation)?;
         transaction.commit()?;
         Ok(record)
     }
+    pub(crate) fn replay_delivery(
+        &mut self,
+        channel: ChannelId,
+        entry: &lightning::chain::channelmonitor::JusticeTransactions,
+        scope: ProtectionScope,
+        feerate: u64,
+        mut towers: Vec<TowerId>,
+    ) -> Result<ReplayResult, PreparationError> {
+        use ReofferBlockedReason as Reason;
+        let txid = entry.revoked_commitment_txid;
+        // Ordinary offers remain read-only until a new job actually needs saving.
+        if has_pending(&self.connection, channel, txid)?
+            || !has_appointment_history(&self.connection, channel, txid)?
+        {
+            return Ok(ReplayResult::Unrecorded);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StorageError::from)?;
+        if has_pending(&transaction, channel, txid)? {
+            return Ok(ReplayResult::Unrecorded);
+        }
+        let Some((signature, fingerprint)) = delivered_claim(&transaction, channel, txid)? else {
+            return Ok(ReplayResult::Blocked(Reason::MissingDeliveryRecord));
+        };
+        let classification = classify_claims(entry).map_err(PreparationError::Classification)?;
+        if !classification.unclassified().is_empty() {
+            return Ok(ReplayResult::Blocked(Reason::UnclassifiedClaims(
+                classification.unclassified().to_vec(),
+            )));
+        }
+        if let Some(claim) = classification.to_local() {
+            if claim_fingerprint(claim.transaction(), u32::from(claim.to_self_delay()))
+                != Some(fingerprint)
+            {
+                return Ok(ReplayResult::Blocked(Reason::ClaimChanged));
+            }
+        }
+        towers.sort_unstable_by_key(TowerId::to_vec);
+        let records = {
+            let mut statement = transaction
+                .prepare(SELECT_COVERAGE_FOR_COMMITMENT)
+                .map_err(StorageError::from)?;
+            let rows = statement
+                .query_map(
+                    params![&channel.0[..], &txid.to_byte_array()[..]],
+                    RawCoverage::read,
+                )
+                .map_err(StorageError::from)?;
+            rows.map(|row| row.map_err(StorageError::from)?.validate())
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let completed: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.completion_ready()
+                    && record.scope() == scope
+                    && record.client_signature() == Some(signature.as_str())
+                    && record.outcome() == CoverageOutcome::ToLocalAppointment
+            })
+            .collect();
+        if completed.is_empty() {
+            return Ok(ReplayResult::Blocked(Reason::IncompleteDelivery));
+        }
+        for tower in &towers {
+            let Some(receipt) = find_receipt(&transaction, *tower, channel, txid)? else {
+                return Ok(ReplayResult::Blocked(Reason::MissingReceipt(*tower)));
+            };
+            if receipt.user_signature() != signature || !receipt.verify(tower) {
+                return Ok(ReplayResult::Blocked(Reason::InvalidReceipt(*tower)));
+            }
+        }
+        let coverage = ClaimCoverage::replayed(&classification);
+        let observation = CoverageRecord::observation(
+            (channel, txid),
+            scope,
+            feerate,
+            &coverage,
+            classification.to_local().map(|_| signature.as_str()),
+            towers,
+        );
+        observation.validate()?;
+        let mut record = store_coverage(&transaction, &observation)?;
+        if !record.completion_ready {
+            transaction
+                .execute(COMPLETE_COVERAGE, [record.id])
+                .map_err(StorageError::from)?;
+            record.completion_ready = true;
+        }
+        transaction.commit().map_err(StorageError::from)?;
+        Ok(ReplayResult::Replayed { record, coverage })
+    }
+
     // Receipt checks and the durable readiness marker share a transaction. A
     // missing receipt is ordinary pending work; corrupt evidence is an error.
     pub(crate) fn complete_coverage(
@@ -592,6 +694,28 @@ impl ClientStore {
                     });
                 }
             }
+            let saved =
+                cryptography::decrypt(&job.appointment().encrypted_blob, &record.commitment_txid)
+                    .map_err(|_| StorageError::InvalidPendingAppointment)?;
+            let fingerprint = claim_fingerprint(&saved, job.appointment().to_self_delay)
+                .ok_or(StorageError::InvalidPendingAppointment)?;
+            let existing =
+                delivered_claim(&transaction, record.channel_id, record.commitment_txid)?;
+            if let Some((signature, prior_fingerprint)) = existing {
+                if signature != job.signature() || fingerprint != prior_fingerprint {
+                    return Err(StorageError::InvalidCoverage.into());
+                }
+            } else {
+                transaction.execute(
+                    INSERT_DELIVERED_APPOINTMENT,
+                    params![
+                        &record.channel_id.0[..],
+                        &record.commitment_txid.to_byte_array()[..],
+                        job.signature(),
+                        &fingerprint[..],
+                    ],
+                )?;
+            }
         }
         if !record.completion_ready {
             transaction.execute(COMPLETE_COVERAGE, [record.id])?;
@@ -626,6 +750,83 @@ fn find_receipt(
             },
         )
         .optional()?)
+}
+
+fn store_coverage(
+    connection: &Connection,
+    observation: &CoverageRecord,
+) -> Result<CoverageRecord, StorageError> {
+    let record = match find_coverage(connection, observation)? {
+        Some(record) => record,
+        None => {
+            connection.execute(
+                INSERT_COVERAGE,
+                params![
+                    &observation.channel_id.0[..],
+                    &observation.commitment_txid.to_byte_array()[..],
+                    observation.scope.id(),
+                    observation.feerate_per_kw,
+                    observation.to_local,
+                    observation.excluded_htlc_claims,
+                    observation.unclassified_claims,
+                    observation.stored_claim_matches,
+                    observation.client_signature.as_deref().unwrap_or(""),
+                    tower_bytes(&observation.required_towers),
+                ],
+            )?;
+            read_coverage(connection, connection.last_insert_rowid())?
+                .ok_or(StorageError::InvalidCoverage)?
+        }
+    };
+    Ok(record)
+}
+
+fn has_appointment_history(
+    connection: &Connection,
+    channel: ChannelId,
+    txid: Txid,
+) -> Result<bool, StorageError> {
+    Ok(connection.query_row(
+        HAS_APPOINTMENT_HISTORY,
+        params![&channel.0[..], &txid.to_byte_array()[..]],
+        |row| row.get(0),
+    )?)
+}
+fn has_pending(
+    connection: &Connection,
+    channel: ChannelId,
+    txid: Txid,
+) -> Result<bool, StorageError> {
+    Ok(connection.query_row(
+        HAS_PENDING_APPOINTMENT,
+        params![&channel.0[..], &txid.to_byte_array()[..]],
+        |row| row.get(0),
+    )?)
+}
+fn delivered_claim(
+    connection: &Connection,
+    channel: ChannelId,
+    txid: Txid,
+) -> Result<Option<(String, [u8; 32])>, StorageError> {
+    let row: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            SELECT_DELIVERED_APPOINTMENT,
+            params![&channel.0[..], &txid.to_byte_array()[..]],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(signature, fingerprint)| {
+        if signature.is_empty() {
+            return Err(StorageError::InvalidCoverage);
+        }
+        Ok((
+            signature,
+            fingerprint
+                .try_into()
+                .map_err(|_| StorageError::InvalidCoverage)?,
+        ))
+    })
+    .transpose()
 }
 
 fn tower_bytes(towers: &[TowerId]) -> Vec<u8> {
@@ -832,6 +1033,8 @@ pub enum StorageError {
     InvalidAppointmentReceipt,
     /// A coverage observation is corrupt, changed, or incompatible with its policy.
     InvalidCoverage,
+    /// The payload is missing but prior evidence forbids preparing a replacement.
+    DeliveryHistoryRequiresReplay,
 }
 
 impl From<rusqlite::Error> for StorageError {
@@ -849,6 +1052,10 @@ impl fmt::Display for StorageError {
             Self::InvalidPendingAppointment => write!(f, "Stored pending appointment is invalid"),
             Self::InvalidAppointmentReceipt => write!(f, "Stored appointment receipt is invalid"),
             Self::InvalidCoverage => write!(f, "Stored coverage record is invalid"),
+            Self::DeliveryHistoryRequiresReplay => write!(
+                f,
+                "Missing payload with delivery history requires validated replay"
+            ),
         }
     }
 }
@@ -861,7 +1068,41 @@ impl Error for StorageError {
             | Self::InvalidRegistration
             | Self::InvalidPendingAppointment
             | Self::InvalidAppointmentReceipt
-            | Self::InvalidCoverage => None,
+            | Self::InvalidCoverage
+            | Self::DeliveryHistoryRequiresReplay => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod history_query_tests {
+    use super::*;
+
+    #[test]
+    fn history_lookup_uses_a_receipt_index_instead_of_scanning_history() {
+        let store = ClientStore::open(":memory:").unwrap();
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {HAS_APPOINTMENT_HISTORY}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params![&[0u8; 32][..], &[1u8; 32][..]], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH appointment_receipts")
+                    && step.contains("appointment_receipts_by_commitment")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.contains("SCAN appointment_receipts")),
+            "{plan:?}"
+        );
     }
 }

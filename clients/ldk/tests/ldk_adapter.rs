@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use ldk_watchtower_client::{
     ClientStore, CoverageOutcome, DeliveryAttempt, DeliveryCoordinator, LdkAdapterEvent,
-    LdkWatchtowerAdapter, LdkWatchtowerWorker, PendingAppointment, ProtectionScope, RetryPolicy,
-    TowerClient, TowerConfig,
+    LdkWatchtowerAdapter, LdkWatchtowerWorker, PendingAppointment, PreparationError,
+    ProtectionScope, ReofferBlockedReason, RetryPolicy, StorageError, TowerClient, TowerConfig,
 };
 use lightning::chain::chainmonitor::WatchtowerPersist;
 use lightning::ln::types::ChannelId;
@@ -63,6 +63,42 @@ impl Fixture {
             adapter,
             towers,
         }
+    }
+    fn restart(&mut self, urls: &[&str], fee: u64) {
+        self.restart_with_destination(
+            urls,
+            fee,
+            common::to_local(144, 0).output[0].script_pubkey.clone(),
+        );
+    }
+    fn restart_with_destination(
+        &mut self,
+        urls: &[&str],
+        fee: u64,
+        destination: lightning::bitcoin::ScriptBuf,
+    ) {
+        let coordinators = self
+            .towers
+            .iter()
+            .zip(urls)
+            .map(|((id, _), url)| {
+                DeliveryCoordinator::new(
+                    TowerClient::new(TowerConfig::new(*id, url, Duration::from_secs(2)).unwrap())
+                        .unwrap(),
+                    RetryPolicy::default(),
+                    RetryPolicy::default(),
+                )
+            })
+            .collect();
+        self.worker = LdkWatchtowerWorker::new(
+            ProtectionScope::ToLocalOnly,
+            ClientStore::open(self.dir.path().join("client.sqlite")).unwrap(),
+            coordinators,
+            fee,
+            destination,
+        )
+        .unwrap();
+        self.adapter = self.worker.adapter();
     }
     fn body(&self, job: &PendingAppointment, tower: usize) -> String {
         let mut receipt = AppointmentReceipt::new(job.signature().into(), 100);
@@ -627,11 +663,22 @@ fn a_receipt_for_a_replaced_database_job_cannot_satisfy_an_old_snapshot() {
     let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
     // Deliberately simulate an unsupported database replacement, not a production
     // recovery policy: changed plaintext must not reuse TEOS's fixed nonce/key.
-    db.execute("DELETE FROM pending_appointments", []).unwrap();
-    f.worker
+    let replacement_payload = teos_common::appointment::Appointment::new(
+        original.appointment().locator,
+        cryptography::encrypt(&common::to_local(144, 1), &original.commitment_txid()).unwrap(),
+        144,
+    );
+    let signature = f
+        .worker
         .store_mut()
-        .prepare_appointment(CHANNEL, &common::justice(vec![common::to_local(144, 1)]))
-        .unwrap();
+        .load_or_create_identity()
+        .unwrap()
+        .sign(&replacement_payload.to_vec());
+    db.execute(
+        "UPDATE pending_appointments SET encrypted_blob=?1, signature=?2",
+        rusqlite::params![replacement_payload.encrypted_blob, signature],
+    )
+    .unwrap();
     let replacement = f.job();
     assert_ne!(replacement.signature(), original.signature());
     let response: AddAppointmentResponse = serde_json::from_str(&f.body(&replacement, 0)).unwrap();
@@ -917,6 +964,13 @@ async fn a_completion_marker_failure_keeps_coverage_pending_without_resubmission
         .appointment_receipt(f.towers[0].0, CHANNEL, txid)
         .unwrap()
         .is_some());
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM delivered_appointments", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "delivery descriptor must roll back with the completion marker"
+    );
     db.execute_batch("DROP TRIGGER fail_completion").unwrap();
     assert!(f.attempts(now).0.is_empty());
     assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
@@ -994,4 +1048,370 @@ async fn changed_coverage_metadata_cannot_authorize_an_in_flight_acknowledgment(
     assert!(f.attempts(now).0.is_empty());
     assert_eq!(completed(&f.adapter), vec![(CHANNEL, txid)]);
     mock.assert_async().await;
+}
+
+async fn completed_fixture(server: &mut Server) -> (Fixture, PendingAppointment, mockito::Mock) {
+    let mut f = Fixture::new(&[&server.url()]);
+    let entry = common::justice(vec![common::to_local(144, 0), common::htlc(true, false)]);
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
+    let (mut attempts, _) = f.attempts(Instant::now());
+    let job = f.job();
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&job, 0))
+        .expect(1)
+        .create_async()
+        .await;
+    let events = f
+        .worker
+        .finish(attempts.pop().unwrap().send().await, Instant::now())
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, LdkAdapterEvent::AcknowledgmentQueued { .. })));
+    // Leave the acknowledgment in memory: simulate a crash before LDK consumes it.
+    (f, job, mock)
+}
+
+fn remove_payload(f: &Fixture) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+    db.execute("DELETE FROM pending_appointments", []).unwrap();
+    db.execute_batch("CREATE TRIGGER forbid_reprepare BEFORE INSERT ON pending_appointments BEGIN SELECT RAISE(ABORT, 'must not reprepare'); END;").unwrap();
+    db
+}
+
+#[tokio::test]
+async fn deleted_payload_reoffer_replays_completed_delivery_after_restart_at_a_new_fee() {
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let db = remove_payload(&f);
+    db.execute("DELETE FROM client_identity", []).unwrap();
+    f.restart(&[&server.url()], 2000);
+    // At the higher fee LDK may omit the formerly generated HTLC claim. Keep
+    // its old exclusion record and record the new snapshot's actual count.
+    let entry = common::justice(vec![common::to_local_with_fee(
+        job.commitment_txid(),
+        144,
+        0,
+        2000,
+    )]);
+    assert!(matches!(
+        f.worker.store_mut().prepare_appointment(CHANNEL, &entry),
+        Err(PreparationError::Storage(
+            StorageError::DeliveryHistoryRequiresReplay
+        ))
+    ));
+    for _ in 0..2 {
+        f.adapter
+            .queue_justice_transactions(CHANNEL, Ok(vec![entry.clone()]));
+        let (attempts, events) = f.attempts(Instant::now());
+        assert!(attempts.is_empty());
+        assert_eq!(
+            completed(&f.adapter),
+            vec![(CHANNEL, job.commitment_txid())]
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LdkAdapterEvent::AcknowledgmentQueued { .. })));
+    }
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM pending_appointments", [], |row| row
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM client_identity", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let records = f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, job.commitment_txid())
+        .unwrap();
+    assert_eq!(
+        records.len(),
+        2,
+        "identical replays must reuse their observation"
+    );
+    assert!(records
+        .iter()
+        .all(|record| record.completion_ready()
+            && record.client_signature() == Some(job.signature())));
+    assert_eq!(records[1].feerate_per_kw(), 2000);
+    assert_eq!(records[0].excluded_htlc_claims(), 1);
+    assert_eq!(records[1].excluded_htlc_claims(), 0);
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn deleted_payload_reoffer_blocks_an_added_required_tower_without_sending() {
+    let mut server = Server::new_async().await;
+    let mut other = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let _db = remove_payload(&f);
+    let (key, public) = cryptography::get_random_keypair();
+    f.towers.push((teos_common::UserId(public), key));
+    let no_send = other
+        .mock("POST", "/add_appointment")
+        .expect(0)
+        .create_async()
+        .await;
+    f.restart(&[&server.url(), &other.url()], 1000);
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local(144, 0)])]),
+    );
+    let (attempts, events) = f.attempts(Instant::now());
+    assert!(attempts.is_empty());
+    assert!(completed(&f.adapter).is_empty());
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            LdkAdapterEvent::ReofferBlocked {
+                reason: ReofferBlockedReason::MissingReceipt(tower),
+                ..
+            } if *tower == f.towers[1].0
+        )),
+        "{events:?}"
+    );
+    assert!(f
+        .worker
+        .store()
+        .pending_appointment(CHANNEL, job.commitment_txid())
+        .unwrap()
+        .is_none());
+    mock.assert_async().await;
+    no_send.assert_async().await;
+}
+
+#[tokio::test]
+async fn deleted_payload_reoffer_rejects_changed_claims_missing_evidence_and_bad_receipts() {
+    for case in [0, 2, 3, 4, 5, 7, 8, 10, 11] {
+        let mut server = Server::new_async().await;
+        let (mut f, job, mock) = completed_fixture(&mut server).await;
+        let db = remove_payload(&f);
+        let mut offered = common::justice(vec![common::to_local(144, 0)]);
+        let reason = match case {
+            0 => {
+                offered.txs[0] = common::to_local(144, 1);
+                ReofferBlockedReason::ClaimChanged
+            }
+            2 => {
+                db.execute("DELETE FROM delivered_appointments", [])
+                    .unwrap();
+                ReofferBlockedReason::MissingDeliveryRecord
+            }
+            3 => {
+                db.execute("UPDATE coverage_records SET completion_ready=0", [])
+                    .unwrap();
+                ReofferBlockedReason::IncompleteDelivery
+            }
+            4 => {
+                db.execute("DELETE FROM appointment_receipts", []).unwrap();
+                ReofferBlockedReason::MissingReceipt(f.towers[0].0)
+            }
+            5 => {
+                db.execute(
+                    "UPDATE appointment_receipts SET tower_signature='corrupt'",
+                    [],
+                )
+                .unwrap();
+                ReofferBlockedReason::InvalidReceipt(f.towers[0].0)
+            }
+            7 => {
+                let mut receipt = AppointmentReceipt::new("different client signature".into(), 100);
+                receipt.sign(&f.towers[0].1);
+                db.execute(
+                    "UPDATE appointment_receipts SET user_signature=?1, tower_signature=?2",
+                    rusqlite::params![receipt.user_signature(), receipt.signature().unwrap()],
+                )
+                .unwrap();
+                ReofferBlockedReason::InvalidReceipt(f.towers[0].0)
+            }
+            8 => {
+                db.execute(
+                    "UPDATE delivered_appointments SET claim_fingerprint=zeroblob(32)",
+                    [],
+                )
+                .unwrap();
+                ReofferBlockedReason::ClaimChanged
+            }
+            11 => {
+                offered.txs[0] = common::to_local(145, 0);
+                ReofferBlockedReason::ClaimChanged
+            }
+            _ => {
+                offered.txs.push(common::to_local(144, 2));
+                offered.txs[1].input[0].witness.clear();
+                let classification = ldk_watchtower_client::classify_claims(&offered).unwrap();
+                ReofferBlockedReason::UnclassifiedClaims(classification.unclassified().to_vec())
+            }
+        };
+        f.restart(&[&server.url()], 1000);
+        f.adapter
+            .queue_justice_transactions(CHANNEL, Ok(vec![offered]));
+        let (attempts, events) = f.attempts(Instant::now());
+        assert!(attempts.is_empty());
+        assert!(completed(&f.adapter).is_empty());
+        assert!(events.iter().any(|event| matches!(event, LdkAdapterEvent::ReofferBlocked { reason: actual, .. } if *actual == reason)),
+            "case {case}: {events:?}");
+        assert!(f
+            .worker
+            .store()
+            .pending_appointment(CHANNEL, job.commitment_txid())
+            .unwrap()
+            .is_none());
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn replay_keeps_delivered_protection_when_destinations_change_or_claims_are_omitted() {
+    for case in [
+        "destination",
+        "configured_destination",
+        "empty",
+        "htlc_only",
+    ] {
+        let mut server = Server::new_async().await;
+        let (mut f, job, mock) = completed_fixture(&mut server).await;
+        let _db = remove_payload(&f);
+        let mut offered = common::justice(vec![common::to_local(144, 0)]);
+        let mut destination = offered.txs[0].output[0].script_pubkey.clone();
+        let expected = match case {
+            "destination" | "configured_destination" => {
+                destination = lightning::bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+                if case == "destination" {
+                    offered.txs[0].output[0].script_pubkey = destination.clone();
+                }
+                CoverageOutcome::ToLocalAppointment
+            }
+            "empty" => {
+                offered.txs.clear();
+                CoverageOutcome::NoClaimsAtFeeRate
+            }
+            _ => {
+                offered.txs = vec![common::htlc(true, false)];
+                CoverageOutcome::NoToLocalClaimAtFeeRate
+            }
+        };
+        f.restart_with_destination(&[&server.url()], 2000, destination);
+        f.adapter
+            .queue_justice_transactions(CHANNEL, Ok(vec![offered]));
+        let (attempts, events) = f.attempts(Instant::now());
+        assert!(attempts.is_empty());
+        assert_eq!(
+            completed(&f.adapter),
+            vec![(CHANNEL, job.commitment_txid())],
+            "{case}: {events:?}"
+        );
+        let records = f
+            .worker
+            .store()
+            .coverage_records(CHANNEL, job.commitment_txid())
+            .unwrap();
+        let current = records.last().unwrap();
+        assert!(current.completion_ready());
+        assert_eq!(current.feerate_per_kw(), 2000);
+        assert_eq!(current.outcome(), expected);
+        assert_eq!(
+            current.client_signature(),
+            (expected == CoverageOutcome::ToLocalAppointment).then_some(job.signature())
+        );
+        assert_eq!(records[0].client_signature(), Some(job.signature()));
+        assert_eq!(records[0].outcome(), CoverageOutcome::ToLocalAppointment);
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn replay_requires_receipts_only_from_the_current_towers() {
+    let mut first = Server::new_async().await;
+    let mut second = Server::new_async().await;
+    let mut f = Fixture::new(&[&first.url(), &second.url()]);
+    let entry = common::justice(vec![common::to_local(144, 0)]);
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![entry.clone()]));
+    let (attempts, _) = f.attempts(Instant::now());
+    let job = f.job();
+    let a = first
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&job, 0))
+        .expect(1)
+        .create_async()
+        .await;
+    let b = second
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&job, 1))
+        .expect(1)
+        .create_async()
+        .await;
+    for attempt in attempts {
+        f.worker
+            .finish(attempt.send().await, Instant::now())
+            .unwrap();
+    }
+    let db = remove_payload(&f);
+    db.execute(
+        "DELETE FROM appointment_receipts WHERE tower_id=?1",
+        [f.towers[1].0.to_vec()],
+    )
+    .unwrap();
+    f.towers.truncate(1);
+    f.restart(&[&first.url()], 1000);
+    f.adapter
+        .queue_justice_transactions(CHANNEL, Ok(vec![entry]));
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    a.assert_async().await;
+    b.assert_async().await;
+}
+
+#[tokio::test]
+async fn replay_allows_an_added_tower_only_with_its_matching_receipt() {
+    let mut first = Server::new_async().await;
+    let mut second = Server::new_async().await;
+    let (mut f, job, a) = completed_fixture(&mut first).await;
+    let (key, public) = cryptography::get_random_keypair();
+    let id = teos_common::UserId(public);
+    f.towers.push((id, key));
+    let b = second
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&job, 1))
+        .expect(1)
+        .create_async()
+        .await;
+    // An independent delivery before cleanup provides evidence for the added
+    // tower; replay need not require a prior observation listing that tower.
+    TowerClient::new(TowerConfig::new(id, &second.url(), Duration::from_secs(2)).unwrap())
+        .unwrap()
+        .submit_appointment(f.worker.store_mut(), CHANNEL, job.commitment_txid())
+        .await
+        .unwrap();
+    let _db = remove_payload(&f);
+    f.restart(&[&first.url(), &second.url()], 1000);
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local(144, 0)])]),
+    );
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    a.assert_async().await;
+    b.assert_async().await;
 }

@@ -16,11 +16,12 @@ use lightning::util::wakers::{Future, Notifier};
 use teos_common::{cryptography, TowerId};
 
 use crate::dbm::CoverageCompletionError;
+use crate::replay::ReplayResult;
 use crate::{
     ClaimClassification, ClientStore, CoverageOutcome, CoverageRecord, DeliveryBatch,
     DeliveryCompletion, DeliveryCoordinator, DeliveryEvent, InvalidDeliveryCompletion,
-    PendingAppointment, PreparationError, ProtectionScope, StorageError, UnclassifiedClaim,
-    VerifiedAppointmentReceipt,
+    PendingAppointment, PreparationError, ProtectionScope, ReofferBlockedReason, StorageError,
+    UnclassifiedClaim, VerifiedAppointmentReceipt,
 };
 
 type JobId = (ChannelId, Txid);
@@ -414,6 +415,55 @@ impl LdkWatchtowerWorker {
             }
             for entry in std::mem::take(&mut work.entries) {
                 let commitment_txid = entry.revoked_commitment_txid;
+                match self.store.replay_delivery(
+                    *channel_id,
+                    &entry,
+                    scope,
+                    feerate,
+                    required_towers.clone(),
+                ) {
+                    Ok(ReplayResult::Unrecorded) => {}
+                    Ok(ReplayResult::Replayed { record, coverage }) => {
+                        events.push(LdkAdapterEvent::Coverage {
+                            channel_id: *channel_id,
+                            commitment_txid,
+                            coverage,
+                            coverage_id: record.id(),
+                        });
+                        if self
+                            .adapter
+                            .queue_ack((*channel_id, commitment_txid), &work.version)
+                        {
+                            events.push(LdkAdapterEvent::AcknowledgmentQueued {
+                                channel_id: *channel_id,
+                                commitment_txid,
+                                scope,
+                                coverage_id: record.id(),
+                            });
+                        }
+                        continue;
+                    }
+                    Ok(ReplayResult::Blocked(reason)) => {
+                        events.push(LdkAdapterEvent::ReofferBlocked {
+                            channel_id: *channel_id,
+                            commitment_txid,
+                            reason,
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        let retry = !matches!(error, PreparationError::Classification(_));
+                        events.push(LdkAdapterEvent::PreparationFailed {
+                            channel_id: *channel_id,
+                            commitment_txid,
+                            error,
+                        });
+                        if retry {
+                            work.entries.push(entry);
+                        }
+                        continue;
+                    }
+                }
                 match self.store.prepare_appointment(*channel_id, &entry) {
                     Ok(prepared) => {
                         let coverage = ClaimCoverage::from_preparation(
@@ -595,6 +645,14 @@ impl ClaimCoverage {
             stored_claim_matches,
         }
     }
+    pub(crate) fn replayed(classification: &ClaimClassification<'_>) -> Self {
+        Self {
+            to_local: classification.to_local().is_some(),
+            recognized_htlc_claims: classification.recognized_htlc_claims(),
+            unclassified: classification.unclassified().to_vec(),
+            stored_claim_matches: classification.to_local().is_some(),
+        }
+    }
     /// Whether a to_local claim was recognized in this snapshot.
     pub fn to_local(&self) -> bool {
         self.to_local
@@ -607,7 +665,8 @@ impl ClaimCoverage {
     pub fn unclassified(&self) -> &[UnclassifiedClaim] {
         &self.unclassified
     }
-    /// Whether the frozen appointment protects the same outpoint and revocation script.
+    /// Whether the offered claim matches the frozen payload or its durable
+    /// completed-delivery fingerprint.
     pub fn stored_claim_matches(&self) -> bool {
         self.stored_claim_matches
     }
@@ -657,6 +716,13 @@ impl Error for LdkAdapterConfigError {}
 /// it does not imply that deliberately excluded HTLC claims are protected.
 #[derive(Debug)]
 pub enum LdkAdapterEvent {
+    /// A missing payload cannot be replaced safely. Resolve the reason and submit
+    /// a fresh complete snapshot; this does not retry or acknowledge automatically.
+    ReofferBlocked {
+        channel_id: ChannelId,
+        commitment_txid: Txid,
+        reason: ReofferBlockedReason,
+    },
     /// No to_local claim was generated. This does not establish that no revocable
     /// output exists: LDK may omit an uneconomical claim at this fee rate.
     NoApplicableClaimAtFeeRate {

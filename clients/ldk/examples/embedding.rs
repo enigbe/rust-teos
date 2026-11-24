@@ -247,6 +247,9 @@ fn report_adapter_events(events: Vec<LdkAdapterEvent>) -> bool {
             LdkAdapterEvent::NoApplicableClaimAtFeeRate { feerate_per_kw, .. } => {
                 eprintln!("No to_local claim generated at {feerate_per_kw} sat/kw: an output may be uneconomical; acknowledgment releases retention");
             }
+            LdkAdapterEvent::ReofferBlocked { reason, .. } => {
+                eprintln!("Re-offer blocked: {reason:?}; restore evidence or configuration and submit a fresh complete snapshot");
+            }
             LdkAdapterEvent::CoverageStorageFailed { .. }
             | LdkAdapterEvent::ReceiptCheckFailed { .. }
             | LdkAdapterEvent::CoordinatorFailed { .. } => {

@@ -1105,7 +1105,7 @@ async fn saved_receipt_remains_verifiable_after_source_job_and_identity_are_remo
         .execute_batch("DELETE FROM pending_appointments; DELETE FROM client_identity;")
         .unwrap();
     drop(fixture.store);
-    let reopened = ClientStore::open(path).unwrap();
+    let mut reopened = ClientStore::open(path).unwrap();
     let restored = reopened
         .appointment_receipt(
             fixture.tower_id,
@@ -1133,6 +1133,18 @@ async fn saved_receipt_remains_verifiable_after_source_job_and_identity_are_remo
         )
         .unwrap()
         .is_none());
+    assert!(
+        matches!(
+            reopened.prepare_appointment(
+                fixture.job.channel_id(),
+                &common::justice(vec![common::to_local(144, 0)]),
+            ),
+            Err(ldk_watchtower_client::PreparationError::Storage(
+                StorageError::DeliveryHistoryRequiresReplay
+            ))
+        ),
+        "receipt-only history must prevent replacement encryption too"
+    );
     mock.assert_async().await;
 }
 

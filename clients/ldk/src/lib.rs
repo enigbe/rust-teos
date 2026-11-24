@@ -21,6 +21,7 @@ mod delivery;
 mod identity;
 mod ldk_adapter;
 mod registration;
+mod replay;
 mod submission;
 
 pub use appointments::{AppointmentPreparation, PendingAppointment, PreparationError};
@@ -41,6 +42,7 @@ pub use ldk_adapter::{
     LdkWatchtowerWorker,
 };
 pub use registration::{RegistrationError, TowerClient};
+pub use replay::ReofferBlockedReason;
 pub use submission::{SubmissionError, VerifiedAppointmentReceipt};
 
 /// Derives the TEOS appointment locator for a revoked counterparty commitment.

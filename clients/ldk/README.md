@@ -73,7 +73,9 @@ clone the needed receipts before borrowing the store. Save them through
 Then persist the application's LDK state and shut it down normally. A crash before
 the next monitor persist may re-offer acknowledged commitments. Saved appointments
 and receipts make that recovery idempotent.
-Reuse the same database, sweep configuration, and required tower set on restart.
+Reuse the same database and signing identity on restart. Fee and destination
+changes do not replace already prepared or delivered payloads. Every currently
+required tower still needs a matching receipt when replaying completed delivery.
 The fee rate is fixed for each worker; an already prepared commitment keeps its
 original payload even if a later worker uses a different fee rate.
 
@@ -88,9 +90,45 @@ The tower signs the client signature and start block, not those lookup IDs.
 A historical receipt identifies the submitted payload by its client signature;
 it does not include the payload bytes or prove that a current job matches it.
 Saving receipts and authorizing acknowledgments still check the expected job.
-This does not enable cleanup yet: safe re-offers must reuse the frozen payload
-or be explicitly rejected, rather than encrypting a changed transaction under
-the same commitment-derived key and fixed nonce.
+## Re-offers after a completed payload is removed
+
+Before queuing an acknowledgment for a delivered `to_local` claim, the worker
+saves a `delivered_appointments` record in the same transaction as scope completion.
+It associates the frozen client signature with a claim fingerprint.
+It matches the pending-payload policy: outpoint, revocation script and CSV
+delay. A changed fee or sweep destination does not invalidate the original
+delivered transaction. These are local recovery metadata, not extra tower-signed
+data; the tower receipt remains bound to the original client signature.
+
+If a pending payload is missing but delivery history exists, replay checks that
+record before preparing anything. A supplied `to_local` claim must match its
+fingerprint, and unclassified claims always block. A completed observation for
+the same scope and client signature must exist. Every currently required tower
+must have a valid receipt for that signature; the tower set need not match the
+old observation. Removing a tower therefore does not invalidate the remaining
+receipts. An added tower without a matching receipt blocks replay.
+
+If LDK omits the claim at the current fee, replay retains the verified delivery
+evidence and records the current no-claim or HTLC-only observation. It still checks
+every current tower's receipt. The original `to_local` delivery observation and
+signature are preserved. The payload is never recreated or sent again.
+Repeated identical replays reuse their coverage observation.
+
+`ReofferBlocked` reports changed revocable claims, missing delivery records,
+incomplete coverage, or missing/invalid receipts. Restore evidence and submit a
+fresh complete snapshot after resolving the reason. The direct
+`prepare_appointment` API also refuses replacement preparation when there is
+history but no pending payload, including inside its write transaction.
+
+The fingerprint hash includes the `teos/claim/v1` domain tag, so a future format
+can be distinguished from this one. Future format changes will require a schema
+migration.
+
+Deliveries predating the delivery-record table acquire records when a valid
+pending payload is next processed; missing payloads without such a record block.
+Preserve receipts, coverage observations and delivery records. Future cleanup
+must only remove jobs with a delivery record. No deletion API is exposed yet;
+general schema versioning and automatic cleanup remain follow-ups.
 
 ## Tests
 
@@ -119,10 +157,11 @@ tower with signed receipts. Each test:
 - Opens a channel and makes payments that revoke both HTLC-free and
   HTLC-bearing commitments, using LDK-generated justice transactions.
 - Delivers a commitment containing both to_local and HTLC claims first, saves
-  its receipt, and simulates a restart before LDK consumes the acknowledgment.
+  its receipt, removes that completed pending payload to simulate cleanup, and
+  restarts at a different justice fee before LDK consumes the acknowledgment.
 - Reloads the serialized channel monitor into a fresh `ChainMonitor` and reopens
   the client database. The saved receipt satisfies delivery without another
-  network request; remaining appointments are delivered from their saved payloads.
+  network request or re-preparation; remaining appointments use their saved payloads.
 - Calls `ChainMonitor::release_pending_monitor_events` to consume acknowledgments
   through LDK's normal path and verifies that watchtower retention is empty.
 - Reopens the database again and verifies receipts, unchanged appointment payloads,
