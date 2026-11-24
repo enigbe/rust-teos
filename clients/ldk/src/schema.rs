@@ -7,7 +7,10 @@ use crate::StorageError;
 // Entry n upgrades version n to n+1. Freeze existing entries; append new ones.
 // Migration SQL must not contain its own transaction control. All pending steps
 // and user_version are committed together under one immediate transaction.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/001_initial.sql"),
+    include_str!("migrations/002_tower_registry.sql"),
+];
 const SELECT_VERSION: &str = "PRAGMA user_version";
 const SELECT_SCHEMA: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master
 WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name";
@@ -135,7 +138,7 @@ mod tests {
     #[test]
     fn failed_migration_chain_rolls_back_ddl_data_and_version_then_can_retry() {
         let mut db = Connection::open_in_memory().unwrap();
-        initialize(&mut db).unwrap();
+        initialize_with(&mut db, &MIGRATIONS[..1]).unwrap();
         db.execute(
             "INSERT INTO client_identity VALUES (1, ?1)",
             [&[1u8; 32][..]],

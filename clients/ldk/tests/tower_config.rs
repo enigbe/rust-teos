@@ -65,9 +65,26 @@ fn rejects_zero_timeout() {
 }
 
 #[test]
-fn accepts_any_nonzero_timeout() {
+fn accepts_a_one_nanosecond_timeout() {
     let timeout = Duration::from_nanos(1);
     let config = TowerConfig::new(tower_id(), "http://tower.example/", timeout).unwrap();
 
     assert_eq!(config.request_timeout(), timeout);
+}
+
+#[test]
+fn accepts_the_maximum_supported_timeout_without_losing_precision() {
+    let timeout = Duration::new(i64::MAX as u64, 999_999_999);
+    let config = TowerConfig::new(tower_id(), "https://tower.example/", timeout).unwrap();
+
+    assert_eq!(config.request_timeout(), timeout);
+}
+
+#[test]
+fn rejects_timeouts_whose_seconds_exceed_sqlites_integer_range() {
+    for timeout in [Duration::from_secs(i64::MAX as u64 + 1), Duration::MAX] {
+        let error = TowerConfig::new(tower_id(), "https://tower.example/", timeout).unwrap_err();
+
+        assert_eq!(error, TowerConfigError::TimeoutTooLarge);
+    }
 }

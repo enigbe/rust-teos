@@ -1,6 +1,6 @@
 //! An embedded watchtower client for LDK-based Lightning nodes using The Eye of Satoshi.
 //!
-//! This crate provides tower connection configuration, persistent client identity,
+//! This crate provides persistent tower connection settings and client identity,
 //! explicit tower registration, claim classification with unclassified-claim diagnostics,
 //! durable appointment preparation, explicit submission with verified tower receipts,
 //! network submission independent of storage access, caller-driven delivery retries,

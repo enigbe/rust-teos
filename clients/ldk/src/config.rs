@@ -19,6 +19,8 @@ pub struct TowerConfig {
 impl TowerConfig {
     /// Validates an HTTP or HTTPS endpoint and a nonzero request timeout.
     ///
+    /// Timeout seconds must fit in SQLite's signed 64-bit integer range;
+    /// subsecond precision is retained.
     /// The tower identity is already validated by its public-key type.
     pub fn new(
         tower_id: TowerId,
@@ -40,6 +42,9 @@ impl TowerConfig {
         }
         if request_timeout.is_zero() {
             return Err(TowerConfigError::ZeroTimeout);
+        }
+        if request_timeout.as_secs() > i64::MAX as u64 {
+            return Err(TowerConfigError::TimeoutTooLarge);
         }
 
         Ok(Self {
@@ -76,6 +81,8 @@ pub enum TowerConfigError {
     MissingHost,
     /// The request timeout is zero.
     ZeroTimeout,
+    /// The request timeout's seconds exceed the signed 64-bit storage range.
+    TimeoutTooLarge,
 }
 
 impl fmt::Display for TowerConfigError {
@@ -87,6 +94,11 @@ impl fmt::Display for TowerConfigError {
             }
             Self::MissingHost => write!(f, "Tower endpoint must include a host"),
             Self::ZeroTimeout => write!(f, "Tower request timeout must be nonzero"),
+            Self::TimeoutTooLarge => write!(
+                f,
+                "Tower request timeout seconds must not exceed {}",
+                i64::MAX
+            ),
         }
     }
 }

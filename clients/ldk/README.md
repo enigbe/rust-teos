@@ -79,16 +79,37 @@ required tower still needs a matching receipt when replaying completed delivery.
 The fee rate is fixed for each worker; an already prepared commitment keeps its
 original payload even if a later worker uses a different fee rate.
 
+## Saved towers
+
+`ClientStore::save_tower(&config)` persists a validated `TowerConfig`, keyed by
+the tower's public identity. Saving the same ID updates only its HTTP endpoint
+and request timeout. `tower(id)` loads one entry and `towers()` lists entries in
+compressed-public-key byte order. Timeout seconds and nanoseconds are stored as
+plain SQLite integers without rounding. `TowerConfig::new` rejects seconds above
+`i64::MAX` with `TowerConfigError::TimeoutTooLarge`.
+
+Saving settings does not contact the tower, register or renew a subscription,
+create a client identity, or change registration receipts and appointments.
+Registration remains an explicit `TowerClient::register` operation. A saved entry
+does not establish that a tower has registered the user or protects any commitment.
+
+An application can load saved settings into the embedding example's
+`Settings::towers`, choosing which entries its worker requires. Saving or updating
+an entry does not reconfigure an existing worker. Loading validates the public
+key, URL, and nonzero timeout again; invalid entries return an error instead of
+being silently omitted from the required tower set.
+
 ## Database versions and migrations
 
 The dedicated client database uses SQLite's `PRAGMA user_version`. The current
-schema version is 1. `ClientStore::open` initializes or upgrades the schema before
+schema version is 2. `ClientStore::open` initializes or upgrades the schema before
 returning; it does not generate a signing identity during initialization.
 
 An empty database is initialized atomically. The known complete unversioned client
-layout is adopted as version 1 without rewriting rows, re-signing payloads, or
-changing coverage IDs and autoincrement state. Partial or unrelated unversioned
-layouts are rejected rather than completed by guessing which tables are missing.
+layout is adopted as version 1 and upgraded without rewriting existing rows,
+re-signing payloads, or changing coverage IDs and autoincrement state. Partial or
+unrelated unversioned layouts are rejected rather than completed by guessing
+which tables are missing.
 Migration does not infer a cleanup decision from old coverage observations.
 
 Unsupported versions return `StorageError::UnsupportedSchemaVersion`. A layout
@@ -98,9 +119,11 @@ These failures do not initialize or repair the existing database. Additional
 indexes and triggers on the client's own tables are preserved; required definitions
 must still match the frozen schema.
 
-The baseline is frozen in `src/migrations/001_initial.sql`. Future changes append
-ordered migrations to the schema module instead of editing previously supported
-versions. Migration SQL must not manage its own transactions. All pending steps,
+The baseline is frozen in `src/migrations/001_initial.sql`. Version 2 adds an empty
+tower registry through `002_tower_registry.sql`; it does not infer connection
+settings from registration receipts. Future changes append ordered migrations
+to the schema module instead of editing previously supported versions.
+Migration SQL must not manage its own transactions. All pending steps,
 including their version markers, run in one immediate transaction: a failure
 rolls the entire upgrade back, so it can be retried after the cause is resolved.
 Concurrent openers recheck the version after acquiring the write lock. Already

@@ -1843,53 +1843,57 @@ async fn cleanup_waits_for_outstanding_coordinator_state_even_if_a_receipt_was_s
 }
 
 #[tokio::test]
-async fn adopting_an_unversioned_database_preserves_valid_delivery_cleanup_and_replay() {
+async fn upgrading_a_baseline_database_preserves_valid_delivery_cleanup_and_replay() {
     use ldk_watchtower_client::CleanupOutcome;
-    let mut server = Server::new_async().await;
-    let (mut f, job, mock) = completed_fixture(&mut server).await;
-    let records = f
-        .worker
-        .store()
-        .coverage_records(CHANNEL, job.commitment_txid())
-        .unwrap();
-    let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
-    // The unversioned baseline has identical DDL and signed data. Clear only the
-    // marker to exercise adoption with valid, operational delivery evidence.
-    db.pragma_update(None, "user_version", 0).unwrap();
-    f.restart(&[&server.url()], 1000);
-    assert_eq!(
-        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    assert_eq!(f.job(), job);
-    assert_eq!(
-        f.worker
+    for source_version in [0, 1] {
+        let mut server = Server::new_async().await;
+        let (mut f, job, mock) = completed_fixture(&mut server).await;
+        let records = f
+            .worker
             .store()
             .coverage_records(CHANNEL, job.commitment_txid())
-            .unwrap(),
-        records
-    );
-    assert_eq!(
-        f.worker
-            .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
-            .unwrap(),
-        CleanupOutcome::Removed
-    );
-    f.restart(&[&server.url()], 2000);
-    f.adapter.queue_justice_transactions(
-        CHANNEL,
-        Ok(vec![common::justice(vec![common::to_local_with_fee(
-            job.commitment_txid(),
-            144,
-            0,
-            2000,
-        )])]),
-    );
-    assert!(f.attempts(Instant::now()).0.is_empty());
-    assert_eq!(
-        completed(&f.adapter),
-        vec![(CHANNEL, job.commitment_txid())]
-    );
-    mock.assert_async().await;
+            .unwrap();
+        let db = rusqlite::Connection::open(f.dir.path().join("client.sqlite")).unwrap();
+        // Recreate the baseline layout while retaining valid, operational evidence.
+        // Both adoption and upgrading must preserve delivery, cleanup, and replay.
+        db.execute("DROP TABLE tower_registry", []).unwrap();
+        db.pragma_update(None, "user_version", source_version)
+            .unwrap();
+        f.restart(&[&server.url()], 1000);
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(f.job(), job);
+        assert_eq!(
+            f.worker
+                .store()
+                .coverage_records(CHANNEL, job.commitment_txid())
+                .unwrap(),
+            records
+        );
+        assert_eq!(
+            f.worker
+                .cleanup_completed_appointment(CHANNEL, job.commitment_txid())
+                .unwrap(),
+            CleanupOutcome::Removed
+        );
+        f.restart(&[&server.url()], 2000);
+        f.adapter.queue_justice_transactions(
+            CHANNEL,
+            Ok(vec![common::justice(vec![common::to_local_with_fee(
+                job.commitment_txid(),
+                144,
+                0,
+                2000,
+            )])]),
+        );
+        assert!(f.attempts(Instant::now()).0.is_empty());
+        assert_eq!(
+            completed(&f.adapter),
+            vec![(CHANNEL, job.commitment_txid())]
+        );
+        mock.assert_async().await;
+    }
 }

@@ -97,7 +97,7 @@ fn fresh_databases_are_versioned_without_creating_an_identity() {
     let path = dir.path().join("client.sqlite");
     let _store = ClientStore::open(&path).unwrap();
     let db = Connection::open(&path).unwrap();
-    assert_eq!(version(&db), 1);
+    assert_eq!(version(&db), 2);
     assert_eq!(
         db.query_row("SELECT count(*) FROM client_identity", [], |row| row
             .get::<_, i64>(0))
@@ -106,7 +106,7 @@ fn fresh_databases_are_versioned_without_creating_an_identity() {
     );
     drop(_store);
     ClientStore::open(&path).unwrap();
-    assert_eq!(version(&db), 1);
+    assert_eq!(version(&db), 2);
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn adopting_the_unversioned_layout_preserves_every_record_and_sequence() {
     let before = snapshot(&db);
     assert_eq!(version(&db), 0);
     let mut store = ClientStore::open(&path).unwrap();
-    assert_eq!(version(&db), 1);
+    assert_eq!(version(&db), 2);
     assert_eq!(snapshot(&db), before);
     assert_eq!(
         store.load_or_create_identity().unwrap().user_id(),
@@ -138,7 +138,7 @@ fn adopting_the_unversioned_layout_preserves_every_record_and_sequence() {
 
 #[test]
 fn unsupported_versions_are_rejected_without_modifying_the_file() {
-    for unsupported in [-1, 2, 999] {
+    for unsupported in [-1, 3, 999] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.sqlite");
         let db = Connection::open(&path).unwrap();
@@ -150,7 +150,7 @@ fn unsupported_versions_are_rejected_without_modifying_the_file() {
         drop(db);
         let before = fs::read(&path).unwrap();
         assert!(
-            matches!(ClientStore::open(&path), Err(StorageError::UnsupportedSchemaVersion { found, supported: 1 }) if found == unsupported),
+            matches!(ClientStore::open(&path), Err(StorageError::UnsupportedSchemaVersion { found, supported: 2 }) if found == unsupported),
             "version {unsupported}"
         );
         assert_eq!(fs::read(&path).unwrap(), before, "version {unsupported}");
@@ -181,7 +181,6 @@ fn a_damaged_versioned_layout_is_rejected_instead_of_recreated() {
     let path = dir.path().join("client.sqlite");
     drop(ClientStore::open(&path).unwrap());
     let db = Connection::open(&path).unwrap();
-    db.pragma_update(None, "user_version", 1).unwrap();
     db.execute("DROP TABLE delivered_appointments", []).unwrap();
     drop(db);
     let before = fs::read(&path).unwrap();
@@ -224,7 +223,7 @@ fn concurrent_openers_initialize_or_adopt_once_without_losing_data() {
             handle.join().unwrap();
         }
         let db = Connection::open(&path).unwrap();
-        assert_eq!(version(&db), 1);
+        assert_eq!(version(&db), 2);
         if let Some(before) = before {
             assert_eq!(snapshot(&db), before);
         }
@@ -266,4 +265,26 @@ fn full_unversioned_layouts_with_changed_constraints_or_required_indexes_are_rej
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
+}
+
+#[test]
+fn upgrading_version_one_preserves_all_records_and_starts_with_an_empty_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("client.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(UNVERSIONED).unwrap();
+    db.pragma_update(None, "user_version", 1).unwrap();
+    seed(&db);
+    let before = snapshot(&db);
+    let store = ClientStore::open(&path).unwrap();
+    assert_eq!(version(&db), 2);
+    assert_eq!(snapshot(&db), before);
+    assert!(store.towers().unwrap().is_empty());
+    drop(store);
+    assert!(ClientStore::open(&path)
+        .unwrap()
+        .towers()
+        .unwrap()
+        .is_empty());
+    assert_eq!(snapshot(&db), before);
 }

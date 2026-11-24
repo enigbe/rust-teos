@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use lightning::bitcoin::{hashes::Hash, secp256k1::SecretKey, Txid};
 use lightning::ln::types::ChannelId;
@@ -16,7 +17,7 @@ use crate::replay::{claim_fingerprint, ReplayResult};
 use crate::{
     classify_claims, ClaimCoverage, CleanupOutcome, ClientIdentity, CoverageOutcome,
     CoverageRecord, PendingAppointment, PreparationError, ProtectionScope, ReofferBlockedReason,
-    VerifiedAppointmentReceipt,
+    TowerConfig, VerifiedAppointmentReceipt,
 };
 
 /// Identifies receipt failures without repeating verification outside the transaction.
@@ -37,6 +38,15 @@ impl From<rusqlite::Error> for CoverageCompletionError {
         Self::Storage(StorageError::from(error))
     }
 }
+
+const UPSERT_TOWER: &str = "INSERT INTO tower_registry
+    (tower_id, endpoint, timeout_seconds, timeout_nanoseconds) VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT (tower_id) DO UPDATE SET endpoint=excluded.endpoint,
+    timeout_seconds=excluded.timeout_seconds, timeout_nanoseconds=excluded.timeout_nanoseconds";
+const SELECT_TOWER: &str = "SELECT tower_id, endpoint, timeout_seconds, timeout_nanoseconds
+FROM tower_registry WHERE tower_id=?1";
+const SELECT_TOWERS: &str = "SELECT tower_id, endpoint, timeout_seconds, timeout_nanoseconds
+FROM tower_registry ORDER BY tower_id";
 
 const SELECT_REGISTRATION: &str =
     "SELECT available_slots, subscription_start, subscription_expiry, signature
@@ -161,6 +171,47 @@ impl ClientStore {
         let mut connection = Connection::open(path)?;
         crate::schema::initialize(&mut connection)?;
         Ok(Self { connection })
+    }
+
+    /// Saves connection settings, updating an existing entry with the same tower ID.
+    ///
+    /// This does not contact or register with the tower, create a client identity,
+    /// or change saved registration receipts, appointments, or worker configuration.
+    /// The application explicitly chooses which saved towers its worker requires.
+    pub fn save_tower(&mut self, config: &TowerConfig) -> Result<(), StorageError> {
+        let timeout = config.request_timeout();
+        self.connection.execute(
+            UPSERT_TOWER,
+            params![
+                config.tower_id().to_vec(),
+                config.endpoint().as_str(),
+                timeout.as_secs() as i64,
+                timeout.subsec_nanos(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Loads and validates one saved tower's connection settings.
+    ///
+    /// Returns `None` only when the tower ID is absent. Invalid saved settings
+    /// return an error without repairing or replacing the entry.
+    pub fn tower(&self, tower_id: TowerId) -> Result<Option<TowerConfig>, StorageError> {
+        self.connection
+            .query_row(SELECT_TOWER, [tower_id.to_vec()], StoredTower::read)
+            .optional()?
+            .map(StoredTower::validate)
+            .transpose()
+    }
+
+    /// Loads saved settings in compressed-public-key byte order.
+    ///
+    /// Any invalid entry fails the call; it is never silently omitted from the
+    /// result. Saved entries do not establish registration or active protection.
+    pub fn towers(&self) -> Result<Vec<TowerConfig>, StorageError> {
+        let mut statement = self.connection.prepare(SELECT_TOWERS)?;
+        let rows = statement.query_map([], StoredTower::read)?;
+        rows.map(|row| row?.validate()).collect()
     }
 
     /// Loads the existing identity, creating and persisting one only if absent.
@@ -759,6 +810,39 @@ impl ClientStore {
     }
 }
 
+struct StoredTower {
+    tower_id: Vec<u8>,
+    endpoint: String,
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+impl StoredTower {
+    fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            tower_id: row.get(0)?,
+            endpoint: row.get(1)?,
+            seconds: row.get(2)?,
+            nanoseconds: row.get(3)?,
+        })
+    }
+
+    fn validate(self) -> Result<TowerConfig, StorageError> {
+        let invalid = || StorageError::InvalidTowerConfig;
+        let tower_id = TowerId::from_slice(&self.tower_id).map_err(|_| invalid())?;
+        let seconds = u64::try_from(self.seconds).map_err(|_| invalid())?;
+        if !(0..1_000_000_000).contains(&self.nanoseconds) {
+            return Err(invalid());
+        }
+        TowerConfig::new(
+            tower_id,
+            &self.endpoint,
+            Duration::new(seconds, self.nanoseconds as u32),
+        )
+        .map_err(|_| invalid())
+    }
+}
+
 // Decode only. Callers verify the tower signature; acknowledgment additionally
 // checks its binding to the expected job within the completion transaction.
 fn find_receipt(
@@ -1106,6 +1190,8 @@ pub enum StorageError {
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     /// The database does not match a supported client schema.
     InvalidSchema,
+    /// A saved tower has an invalid identity, endpoint, or request timeout.
+    InvalidTowerConfig,
     /// The stored signing key has an invalid length or scalar value.
     InvalidIdentity,
     /// A stored registration receipt has invalid subscription data or a bad signature.
@@ -1133,6 +1219,7 @@ impl fmt::Display for StorageError {
             Self::UnsupportedSchemaVersion { found, supported } => write!(f,
                 "Unsupported client schema version {found}; this client supports versions through {supported}"),
             Self::InvalidSchema => write!(f, "Database layout does not match a supported LDK client schema"),
+            Self::InvalidTowerConfig => write!(f, "Stored tower connection settings are invalid"),
             Self::InvalidIdentity => write!(f, "Stored client signing key is invalid"),
             Self::InvalidRegistration => write!(f, "Stored tower registration is invalid"),
             Self::InvalidPendingAppointment => write!(f, "Stored pending appointment is invalid"),
@@ -1152,6 +1239,7 @@ impl Error for StorageError {
             Self::Sqlite(error) => Some(error),
             Self::UnsupportedSchemaVersion { .. }
             | Self::InvalidSchema
+            | Self::InvalidTowerConfig
             | Self::InvalidIdentity
             | Self::InvalidRegistration
             | Self::InvalidPendingAppointment

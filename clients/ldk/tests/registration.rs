@@ -52,6 +52,56 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn updating_saved_tower_settings_preserves_identity_and_registration_evidence() {
+    let mut server = Server::new_async().await;
+    let mut fixture = Fixture::new();
+    let config = TowerConfig::new(fixture.tower_id, &server.url(), Duration::from_secs(5)).unwrap();
+    fixture.store.save_tower(&config).unwrap();
+    let receipt = fixture.receipt(10000, 4420);
+    let mock = server
+        .mock("POST", "/register")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&receipt).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+    TowerClient::new(config)
+        .unwrap()
+        .register(&mut fixture.store)
+        .await
+        .unwrap();
+    let updated = TowerConfig::new(
+        fixture.tower_id,
+        "https://new.example/",
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    fixture.store.save_tower(&updated).unwrap();
+    drop(fixture.store);
+    let mut reopened = ClientStore::open(fixture.directory.path().join("client.sqlite3")).unwrap();
+    assert_eq!(
+        reopened.load_or_create_identity().unwrap().user_id(),
+        fixture.identity.user_id()
+    );
+    assert_eq!(
+        reopened
+            .registration(fixture.tower_id, fixture.identity.user_id())
+            .unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(
+        reopened
+            .tower(fixture.tower_id)
+            .unwrap()
+            .unwrap()
+            .endpoint(),
+        updated.endpoint()
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
 async fn registers_the_persisted_identity_and_restores_its_receipt() {
     let mut server = Server::new_async().await;
     let mut fixture = Fixture::new();
