@@ -300,13 +300,17 @@ registration, submission, signed receipt persistence, restart recovery, and LDK
 acknowledgment against real services. It does not publish a revoked commitment or
 prove that the tower broadcasts a successful on-chain justice transaction.
 
-## Live on-chain legacy breach
+## Live on-chain breaches
 
-The separate `onchain_breach` test funds a legacy channel with real regtest UTXOs,
-confirms the funding transaction, and makes payments through two LDK nodes. It
-captures a signed commitment before a later payment revokes it, then delivers the
-LDK-generated `to_local` justice appointment to TEOS and verifies its receipt and
-normal ChainMonitor acknowledgment.
+The `onchain_breach` test target exercises legacy and anchor channels with real
+regtest UTXOs. Each scenario confirms the funding transaction, checks that both
+peers negotiated the requested channel type, and makes payments through two LDK
+nodes. It captures a signed commitment before a later payment revokes it, then
+delivers the LDK-generated `to_local` justice appointment to TEOS and verifies its
+receipt and normal ChainMonitor acknowledgment.
+
+The published commitment must have two 330-sat P2WSH anchor outputs for the anchor
+case and none for the legacy case.
 
 Both LDK nodes and the worker are dropped before the revoked commitment is
 broadcast. Their broadcasters only record transactions and have no Bitcoin RPC
@@ -329,9 +333,11 @@ services, so compilation is outside the execution timeout. The first build may
 fetch dependencies, including the pinned LDK revision; offline mode is not forced.
 It then starts isolated localhost regtest Bitcoin and TEOS services with separate
 free ports for Bitcoin RPC, both TEOS RPC interfaces, and HTTP. It sets the tower's
-polling interval to one second and invokes the ignored test. It stops both services
-and removes their temporary data on success or failure. Use `--teosd /path/to/teosd`
-to select another binary. It does not use existing node data directories or real funds.
+polling interval to one second and runs both ignored tests sequentially on that
+chain, each with a fresh wallet, signing identity, and client database. It stops
+both services and removes their temporary data on success or failure. Use
+`--teosd /path/to/teosd` to select another binary. It does not use existing node data
+directories or real funds.
 
 To run the ignored test directly against disposable services, provide
 `TEOS_E2E_URL`, `TEOS_E2E_TOWER_ID`, `TEOS_E2E_BITCOIN_RPC_URL`,
@@ -339,13 +345,15 @@ To run the ignored test directly against disposable services, provide
 
 ```sh
 cargo test -p ldk-watchtower-client --locked --features integration-tests \
-  --test onchain_breach live_teos_legacy_breach -- --ignored --exact
+  --test onchain_breach -- --ignored --test-threads=1
 ```
 
-The test checks the Bitcoin network is regtest before creating a wallet or mining.
-A direct run creates a wallet, mines blocks, and consumes tower subscription slots;
-use disposable services. This scenario covers legacy `to_local` recovery only,
-not anchor-channel or HTLC recovery.
+Each test checks the Bitcoin network is regtest before creating a wallet or mining.
+A direct run creates wallets, mines blocks, and consumes tower subscription slots;
+use disposable services. Run the cases sequentially because they mine on the same
+chain. To run only one case, insert `live_teos_legacy_breach` or
+`live_teos_anchor_breach` before `--` in the command above. Both scenarios cover
+`to_local` recovery; they do not test HTLC recovery.
 
 An existing Docker Compose regtest stack can also supply these services. Set
 `polling_delta = 1` in TEOS's `teos.toml`, wait for its HTTP API to be ready, and

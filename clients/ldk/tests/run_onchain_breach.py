@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the opt-in legacy breach test with isolated regtest services."""
+"""Run legacy and anchor breach tests with isolated regtest services."""
 
 import argparse
 from contextlib import ExitStack
@@ -105,11 +105,14 @@ def main():
                 TEOS_E2E_BITCOIN_RPC_USER="test",
                 TEOS_E2E_BITCOIN_RPC_PASSWORD="test",
             )
-            subprocess.run(
-                [*test_command, "live_teos_legacy_breach", "--", "--ignored", "--exact"],
-                cwd=ROOT, env=env, check=True, timeout=300,
-            )
-            print("Legacy breach and confirmed TEOS justice passed.", flush=True)
+            # These scenarios mine on the same isolated chain. Run them one at
+            # a time, each with its own wallet, identity, and client database.
+            for test in ["live_teos_legacy_breach", "live_teos_anchor_breach"]:
+                subprocess.run(
+                    [*test_command, test, "--", "--ignored", "--exact"],
+                    cwd=ROOT, env=env, check=True, timeout=300,
+                )
+            print("Legacy and anchor breaches with confirmed TEOS justice passed.", flush=True)
         except BaseException:
             for name in ["bitcoin.log", "tower.log"]:
                 path = work / name

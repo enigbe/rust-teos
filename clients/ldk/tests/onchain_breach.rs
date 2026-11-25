@@ -1,4 +1,4 @@
-//! Opt-in legacy-channel penalty test against disposable regtest Bitcoin and TEOS.
+//! Opt-in channel penalty tests against disposable regtest Bitcoin and TEOS.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +15,8 @@ use lightning::ln::functional_test_utils::{
     check_added_monitors, connect_block, create_chan_between_nodes_with_value_b,
     create_chanmon_cfgs, create_funding_transaction, create_network, create_node_cfgs,
     exchange_open_accept_chan, expect_channel_pending_event, expect_channel_ready_event,
-    send_payment, test_legacy_channel_config, update_nodes_with_chan_announce, Node,
+    send_payment, test_default_channel_config, test_legacy_channel_config,
+    update_nodes_with_chan_announce, Node,
 };
 use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 use lightning::routing::gossip::NetworkGraph;
@@ -103,6 +104,21 @@ impl Bitcoin {
 #[tokio::test]
 #[ignore = "requires disposable regtest Bitcoin and TEOS; mines blocks and creates a wallet"]
 async fn live_teos_legacy_breach() {
+    exercise_breach(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable regtest Bitcoin and TEOS; mines blocks and creates a wallet"]
+async fn live_teos_anchor_breach() {
+    exercise_breach(true).await;
+}
+
+async fn exercise_breach(anchors: bool) {
+    let channel_config = if anchors {
+        test_default_channel_config()
+    } else {
+        test_legacy_channel_config()
+    };
     let bitcoin = Bitcoin::from_env();
     assert_eq!(
         bitcoin.call("getblockchaininfo", json!([])).await["chain"],
@@ -192,7 +208,7 @@ async fn live_teos_legacy_breach() {
                     cfg.keys_manager,
                     cfg.keys_manager,
                     cfg.keys_manager,
-                    test_legacy_channel_config(),
+                    channel_config.clone(),
                     ChainParameters {
                         network: Network::Regtest,
                         best_block: BlockLocator::from_network(Network::Regtest),
@@ -264,11 +280,17 @@ async fn live_teos_legacy_breach() {
         let (announcement, first_update, second_update) =
             create_chan_between_nodes_with_value_b(&nodes[0], &nodes[1], &(ready_a, signatures_a));
         update_nodes_with_chan_announce(&nodes, 0, 1, &announcement, &first_update, &second_update);
-        assert!(!nodes[1].node.list_channels()[0]
-            .channel_type
-            .as_ref()
-            .unwrap()
-            .supports_anchors_zero_fee_htlc_tx());
+        for node in &nodes {
+            assert_eq!(
+                node.node.list_channels()[0]
+                    .channel_type
+                    .as_ref()
+                    .unwrap()
+                    .supports_anchors_zero_fee_htlc_tx(),
+                anchors,
+                "both peers must negotiate the requested channel type"
+            );
+        }
         send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
         let revoked = nodes[0]
             .chain_monitor
@@ -295,7 +317,7 @@ async fn live_teos_legacy_breach() {
             classify_claims(entry)
                 .unwrap()
                 .to_local()
-                .expect("legacy commitment must have a to_local claim")
+                .expect("the revoked commitment must have a to_local claim")
                 .transaction()
                 .clone()
         };
@@ -364,6 +386,16 @@ async fn live_teos_legacy_breach() {
         )
     };
 
+    let anchor_outputs = revoked
+        .output
+        .iter()
+        .filter(|output| output.value.to_sat() == 330 && output.script_pubkey.is_p2wsh())
+        .count();
+    assert_eq!(
+        anchor_outputs,
+        if anchors { 2 } else { 0 },
+        "the published commitment must have the expected 330-sat P2WSH anchor outputs"
+    );
     assert_eq!(justice.input.len(), 1);
     assert_eq!(justice.output.len(), 1);
     assert_eq!(
