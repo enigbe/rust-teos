@@ -299,3 +299,56 @@ The Lightning nodes use LDK's simulated chain fixtures. The live test verifies
 registration, submission, signed receipt persistence, restart recovery, and LDK
 acknowledgment against real services. It does not publish a revoked commitment or
 prove that the tower broadcasts a successful on-chain justice transaction.
+
+## Live on-chain legacy breach
+
+The separate `onchain_breach` test funds a legacy channel with real regtest UTXOs,
+confirms the funding transaction, and makes payments through two LDK nodes. It
+captures a signed commitment before a later payment revokes it, then delivers the
+LDK-generated `to_local` justice appointment to TEOS and verifies its receipt and
+normal ChainMonitor acknowledgment.
+
+Both LDK nodes and the worker are dropped before the revoked commitment is
+broadcast. Their broadcasters only record transactions and have no Bitcoin RPC
+connection. The test itself broadcasts funding and the revoked commitment; it
+never submits the justice transaction. It waits for TEOS to broadcast the exact
+saved justice transaction, then checks that it confirms, pays the sweep script,
+and spends the breached output.
+The LDK fixtures are configured for regtest and receive actual Bitcoin blocks.
+Bitcoin validates the funding, revoked commitment, and justice spends.
+
+With wallet-enabled `bitcoind` and `bitcoin-cli` on `PATH`, run from the project root:
+
+```sh
+cargo build -p teos --bin teosd --locked
+python3 clients/ldk/tests/run_onchain_breach.py
+```
+
+The runner compiles the test with the `integration-tests` feature before starting
+services, so compilation is outside the execution timeout. The first build may
+fetch dependencies, including the pinned LDK revision; offline mode is not forced.
+It then starts isolated localhost regtest Bitcoin and TEOS services with separate
+free ports for Bitcoin RPC, both TEOS RPC interfaces, and HTTP. It sets the tower's
+polling interval to one second and invokes the ignored test. It stops both services
+and removes their temporary data on success or failure. Use `--teosd /path/to/teosd`
+to select another binary. It does not use existing node data directories or real funds.
+
+To run the ignored test directly against disposable services, provide
+`TEOS_E2E_URL`, `TEOS_E2E_TOWER_ID`, `TEOS_E2E_BITCOIN_RPC_URL`,
+`TEOS_E2E_BITCOIN_RPC_USER`, and `TEOS_E2E_BITCOIN_RPC_PASSWORD`, then run:
+
+```sh
+cargo test -p ldk-watchtower-client --locked --features integration-tests \
+  --test onchain_breach live_teos_legacy_breach -- --ignored --exact
+```
+
+The test checks the Bitcoin network is regtest before creating a wallet or mining.
+A direct run creates a wallet, mines blocks, and consumes tower subscription slots;
+use disposable services. This scenario covers legacy `to_local` recovery only,
+not anchor-channel or HTLC recovery.
+
+An existing Docker Compose regtest stack can also supply these services. Set
+`polling_delta = 1` in TEOS's `teos.toml`, wait for its HTTP API to be ready, and
+use the environment variables above to run the Rust test directly. Manage that
+stack's state and lifecycle separately; the isolated runner remains the primary
+reproducible test command.
