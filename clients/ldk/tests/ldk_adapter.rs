@@ -1897,3 +1897,93 @@ async fn upgrading_a_baseline_database_preserves_valid_delivery_cleanup_and_repl
         mock.assert_async().await;
     }
 }
+
+#[tokio::test]
+async fn removing_saved_settings_preserves_delivery_evidence_and_the_running_worker() {
+    let mut server = Server::new_async().await;
+    let (mut f, job, mock) = completed_fixture(&mut server).await;
+    let tower_id = f.towers[0].0;
+    let config = TowerConfig::new(tower_id, &server.url(), Duration::from_secs(2)).unwrap();
+    f.worker.store_mut().save_tower(&config).unwrap();
+    let records = f
+        .worker
+        .store()
+        .coverage_records(CHANNEL, job.commitment_txid())
+        .unwrap();
+    let receipt = f
+        .worker
+        .store()
+        .appointment_receipt(tower_id, CHANNEL, job.commitment_txid())
+        .unwrap();
+    assert!(f.worker.store_mut().remove_tower(tower_id).unwrap());
+    assert_eq!(f.job(), job);
+    assert_eq!(
+        f.worker
+            .store()
+            .coverage_records(CHANNEL, job.commitment_txid())
+            .unwrap(),
+        records
+    );
+    assert_eq!(
+        f.worker
+            .store()
+            .appointment_receipt(tower_id, CHANNEL, job.commitment_txid())
+            .unwrap(),
+        receipt
+    );
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![
+            common::to_local(144, 0),
+            common::htlc(true, false),
+        ])]),
+    );
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn removing_saved_settings_does_not_cancel_an_in_flight_delivery() {
+    let mut server = Server::new_async().await;
+    let mut f = Fixture::new(&[&server.url()]);
+    let tower_id = f.towers[0].0;
+    f.worker
+        .store_mut()
+        .save_tower(&TowerConfig::new(tower_id, &server.url(), Duration::from_secs(2)).unwrap())
+        .unwrap();
+    f.adapter.queue_justice_transactions(
+        CHANNEL,
+        Ok(vec![common::justice(vec![common::to_local(144, 0)])]),
+    );
+    let (mut attempts, _) = f.attempts(Instant::now());
+    assert_eq!(attempts.len(), 1);
+    let job = f.job();
+    assert!(f.worker.store_mut().remove_tower(tower_id).unwrap());
+    assert!(f.attempts(Instant::now()).0.is_empty());
+    assert!(completed(&f.adapter).is_empty());
+    let mock = server
+        .mock("POST", "/add_appointment")
+        .with_status(200)
+        .with_body(f.body(&job, 0))
+        .expect(1)
+        .create_async()
+        .await;
+    f.worker
+        .finish(attempts.pop().unwrap().send().await, Instant::now())
+        .unwrap();
+    assert!(f
+        .worker
+        .store()
+        .appointment_receipt(tower_id, CHANNEL, job.commitment_txid())
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        completed(&f.adapter),
+        vec![(CHANNEL, job.commitment_txid())]
+    );
+    mock.assert_async().await;
+}

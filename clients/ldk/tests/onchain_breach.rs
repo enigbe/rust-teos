@@ -372,6 +372,25 @@ async fn exercise_breach(anchors: bool) {
                 .contains(&txid),
             "normal ChainMonitor acknowledgment must release this commitment"
         );
+        // Subscription state is observable after delivery, but remains separate
+        // from the signed evidence already used for the acknowledgment above.
+        let identity = worker.store_mut().load_or_create_identity().unwrap();
+        let registration = worker
+            .store()
+            .registration(tower.tower_id(), identity.user_id())
+            .unwrap()
+            .unwrap();
+        let info = TowerClient::new(tower.clone())
+            .unwrap()
+            .subscription_info(&identity)
+            .await
+            .unwrap();
+        assert!(info.locators().contains(&job.appointment().locator));
+        assert!(info.available_slots() < registration.available_slots());
+        assert_eq!(
+            info.subscription_expiry(),
+            registration.subscription_expiry()
+        );
         assert!(nodes.iter().all(|node| node
             .tx_broadcaster
             .txn_broadcasted

@@ -1,7 +1,8 @@
 //! An embedded watchtower client for LDK-based Lightning nodes using The Eye of Satoshi.
 //!
 //! This crate provides persistent tower connection settings and client identity,
-//! explicit tower registration, claim classification with unclassified-claim diagnostics,
+//! explicit tower registration, unsigned subscription queries, evidence-preserving
+//! tower removal, claim classification with unclassified-claim diagnostics,
 //! durable appointment preparation, explicit submission with verified tower receipts,
 //! network submission independent of storage access, caller-driven delivery retries,
 //! an LDK persistence adapter with explicit protection scope, explicit completed-job
@@ -26,6 +27,8 @@ mod registration;
 mod replay;
 mod schema;
 mod submission;
+mod subscription;
+mod tower_response;
 
 pub use appointments::{AppointmentPreparation, PendingAppointment, PreparationError};
 pub use claims::{
@@ -48,6 +51,7 @@ pub use ldk_adapter::{
 pub use registration::{RegistrationError, TowerClient};
 pub use replay::ReofferBlockedReason;
 pub use submission::{SubmissionError, VerifiedAppointmentReceipt};
+pub use subscription::{SubscriptionError, SubscriptionInfo};
 
 /// Derives the TEOS appointment locator for a revoked counterparty commitment.
 ///

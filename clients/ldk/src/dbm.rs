@@ -47,6 +47,7 @@ const SELECT_TOWER: &str = "SELECT tower_id, endpoint, timeout_seconds, timeout_
 FROM tower_registry WHERE tower_id=?1";
 const SELECT_TOWERS: &str = "SELECT tower_id, endpoint, timeout_seconds, timeout_nanoseconds
 FROM tower_registry ORDER BY tower_id";
+const DELETE_TOWER: &str = "DELETE FROM tower_registry WHERE tower_id=?1";
 
 const SELECT_REGISTRATION: &str =
     "SELECT available_slots, subscription_start, subscription_expiry, signature
@@ -212,6 +213,20 @@ impl ClientStore {
         let mut statement = self.connection.prepare(SELECT_TOWERS)?;
         let rows = statement.query_map([], StoredTower::read)?;
         rows.map(|row| row?.validate()).collect()
+    }
+
+    /// Removes only this tower's saved connection settings.
+    ///
+    /// Returns whether an entry was removed; repeated removal returns `false`.
+    /// Client identity, registration receipts, pending appointments, delivery
+    /// evidence, and coverage history are retained. This neither contacts the
+    /// tower nor cancels its existing appointments.
+    ///
+    /// A running worker still requires its configured towers. Rebuild it with an
+    /// explicitly changed required-tower set to retire a tower from delivery.
+    /// Startup with the removed ID still selected fails instead of omitting it.
+    pub fn remove_tower(&mut self, tower_id: TowerId) -> Result<bool, StorageError> {
+        Ok(self.connection.execute(DELETE_TOWER, [tower_id.to_vec()])? != 0)
     }
 
     /// Loads the existing identity, creating and persisting one only if absent.

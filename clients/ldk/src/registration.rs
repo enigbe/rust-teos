@@ -7,9 +7,7 @@ use teos_common::receipts::RegistrationReceipt;
 
 use crate::{ClientStore, StorageError, TowerConfig};
 
-// TODO: Share bounded response reading and rejection parsing with submission in a
-// follow-up, preserving registration error codes and separating malformed replies
-// from transport failures. Registration must keep its explicit no-retry behavior.
+use crate::tower_response::{read_success, ResponseError, MAX_RESPONSE_BYTES};
 
 /// An HTTP client for a single TEOS tower.
 ///
@@ -49,6 +47,9 @@ impl TowerClient {
     /// storing the signed receipt. Success means local persistence also succeeded.
     /// This does not retry: the tower may already have changed the subscription if
     /// the response is lost or local storage fails. Callers must not blindly retry.
+    /// HTTP 200 bodies are limited to 16 KiB; rejection bodies and messages to
+    /// 4 KiB. Tower codes from complete JSON errors are preserved. Malformed replies
+    /// and body-transfer failures are separate; neither triggers re-registration.
     pub async fn register(
         &self,
         store: &mut ClientStore,
@@ -64,11 +65,9 @@ impl TowerClient {
             })
             .send()
             .await?;
-        if response.status() != StatusCode::OK {
-            return Err(RegistrationError::HttpStatus(response.status()));
-        }
-
-        let response: RegisterResponse = response.json().await?;
+        let body = read_success(response, MAX_RESPONSE_BYTES).await?;
+        let response: RegisterResponse =
+            serde_json::from_slice(&body).map_err(RegistrationError::InvalidResponse)?;
         if response.user_id != user_id.to_vec() {
             return Err(RegistrationError::UnexpectedUser);
         }
@@ -94,10 +93,23 @@ impl TowerClient {
 /// A failure to register with a tower or save its verified receipt.
 #[derive(Debug)]
 pub enum RegistrationError {
-    /// Request setup, transport, timeout, or JSON decoding failed.
+    /// Request setup, transport, or timeout failed before receiving response headers.
     Request(reqwest::Error),
-    /// The tower returned an HTTP status other than 200 OK.
-    HttpStatus(StatusCode),
+    /// Reading the body failed after receiving its HTTP status.
+    ResponseRead {
+        status: StatusCode,
+        source: reqwest::Error,
+    },
+    /// An HTTP 200 body exceeded the 16 KiB response limit.
+    ResponseTooLarge { status: StatusCode, limit: usize },
+    /// A complete HTTP 200 body could not be decoded as a registration response.
+    InvalidResponse(serde_json::Error),
+    /// An HTTP status other than 200, with any tower code and bounded message.
+    Rejected {
+        status: StatusCode,
+        error_code: Option<u32>,
+        message: String,
+    },
     /// The tower's response identifies a different client.
     UnexpectedUser,
     /// Subscription expiry is not later than its start.
@@ -106,6 +118,24 @@ pub enum RegistrationError {
     InvalidSignature,
     /// The client identity or registration could not be persisted or loaded.
     Storage(StorageError),
+}
+
+impl From<ResponseError> for RegistrationError {
+    fn from(error: ResponseError) -> Self {
+        match error {
+            ResponseError::Read { status, source } => Self::ResponseRead { status, source },
+            ResponseError::TooLarge { status, limit } => Self::ResponseTooLarge { status, limit },
+            ResponseError::Rejected {
+                status,
+                error_code,
+                message,
+            } => Self::Rejected {
+                status,
+                error_code,
+                message,
+            },
+        }
+    }
 }
 
 impl From<reqwest::Error> for RegistrationError {
@@ -124,7 +154,28 @@ impl fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Request(error) => write!(f, "Tower registration request failed: {error}"),
-            Self::HttpStatus(status) => write!(f, "Tower registration returned HTTP {status}"),
+            Self::ResponseRead { status, source } => write!(
+                f,
+                "Cannot read tower registration response (HTTP {status}): {source}"
+            ),
+            Self::ResponseTooLarge { status, limit } => write!(
+                f,
+                "Tower registration response (HTTP {status}) exceeds {limit} bytes"
+            ),
+            Self::InvalidResponse(error) => {
+                write!(f, "Invalid tower registration response: {error}")
+            }
+            Self::Rejected {
+                status,
+                error_code,
+                message,
+            } => {
+                write!(f, "Tower registration rejected with HTTP {status}")?;
+                if let Some(code) = error_code {
+                    write!(f, " (error code {code})")?;
+                }
+                write!(f, ": {message}")
+            }
             Self::UnexpectedUser => write!(f, "Tower registration identifies a different client"),
             Self::InvalidSubscription => {
                 write!(f, "Tower registration has an invalid subscription range")
@@ -139,6 +190,8 @@ impl Error for RegistrationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Request(error) => Some(error),
+            Self::ResponseRead { source, .. } => Some(source),
+            Self::InvalidResponse(error) => Some(error),
             Self::Storage(error) => Some(error),
             _ => None,
         }

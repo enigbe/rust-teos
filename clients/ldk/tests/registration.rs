@@ -52,7 +52,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn updating_saved_tower_settings_preserves_identity_and_registration_evidence() {
+async fn updating_and_removing_saved_settings_preserve_identity_and_registration_evidence() {
     let mut server = Server::new_async().await;
     let mut fixture = Fixture::new();
     let config = TowerConfig::new(fixture.tower_id, &server.url(), Duration::from_secs(5)).unwrap();
@@ -88,7 +88,7 @@ async fn updating_saved_tower_settings_preserves_identity_and_registration_evide
         reopened
             .registration(fixture.tower_id, fixture.identity.user_id())
             .unwrap(),
-        Some(receipt)
+        Some(receipt.clone())
     );
     assert_eq!(
         reopened
@@ -97,6 +97,18 @@ async fn updating_saved_tower_settings_preserves_identity_and_registration_evide
             .unwrap()
             .endpoint(),
         updated.endpoint()
+    );
+    assert!(reopened.remove_tower(fixture.tower_id).unwrap());
+    assert!(reopened.tower(fixture.tower_id).unwrap().is_none());
+    assert_eq!(
+        reopened
+            .registration(fixture.tower_id, fixture.identity.user_id())
+            .unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(
+        reopened.load_or_create_identity().unwrap().user_id(),
+        fixture.identity.user_id()
     );
     mock.assert_async().await;
 }
@@ -226,9 +238,10 @@ async fn rejects_malformed_responses() {
             .await;
         let client = fixture.client(&server.url(), Duration::from_secs(5));
 
-        assert!(
-            matches!(client.register(&mut fixture.store).await, Err(RegistrationError::Request(error)) if error.is_decode())
-        );
+        assert!(matches!(
+            client.register(&mut fixture.store).await,
+            Err(RegistrationError::InvalidResponse(_))
+        ));
         assert!(fixture.saved().is_none());
         mock.assert_async().await;
     }
@@ -270,7 +283,7 @@ async fn reports_http_errors_without_retrying() {
         let client = fixture.client(&server.url(), Duration::from_secs(5));
 
         assert!(
-            matches!(client.register(&mut fixture.store).await, Err(RegistrationError::HttpStatus(code)) if code.as_u16() == status as u16)
+            matches!(client.register(&mut fixture.store).await, Err(RegistrationError::Rejected { status: code, .. }) if code.as_u16() == status as u16)
         );
         assert!(fixture.saved().is_none());
         mock.assert_async().await;
@@ -296,7 +309,7 @@ async fn does_not_follow_registration_redirects() {
     let client = fixture.client(&server.url(), Duration::from_secs(5));
 
     assert!(
-        matches!(client.register(&mut fixture.store).await, Err(RegistrationError::HttpStatus(code)) if code.as_u16() == 303)
+        matches!(client.register(&mut fixture.store).await, Err(RegistrationError::Rejected { status: code, .. }) if code.as_u16() == 303)
     );
     assert!(fixture.saved().is_none());
     mock.assert_async().await;
@@ -447,4 +460,124 @@ async fn rejects_a_tampered_stored_receipt() {
         Err(StorageError::InvalidRegistration)
     ));
     mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn preserves_registration_rejections_without_retrying_or_losing_saved_evidence() {
+    for code in [32, 65, 999] {
+        let mut server = Server::new_async().await;
+        let mut fixture = Fixture::new();
+        let receipt = fixture.receipt(10000, 4420);
+        let first = server
+            .mock("POST", "/register")
+            .with_status(200)
+            .with_body(serde_json::to_string(&receipt).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let client = fixture.client(&server.url(), Duration::from_secs(5));
+        client.register(&mut fixture.store).await.unwrap();
+        let rejected = server
+            .mock("POST", "/register")
+            .with_status(503)
+            .with_body(json!({"error": "tower unavailable", "error_code": code}).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        assert!(matches!(client.register(&mut fixture.store).await,
+            Err(RegistrationError::Rejected { status, error_code: Some(found), message })
+                if status.as_u16() == 503 && found == code && message == "tower unavailable"));
+        assert_eq!(fixture.saved(), Some(receipt));
+        first.assert_async().await;
+        rejected.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn bounds_registration_success_and_rejection_bodies() {
+    for status in [200, 502] {
+        let mut server = Server::new_async().await;
+        let mut fixture = Fixture::new();
+        let mock = server
+            .mock("POST", "/register")
+            .with_status(status)
+            .with_body("x".repeat(20000))
+            .expect(1)
+            .create_async()
+            .await;
+        let result = fixture
+            .client(&server.url(), Duration::from_secs(5))
+            .register(&mut fixture.store)
+            .await;
+        if status == 200 {
+            assert!(matches!(
+                result,
+                Err(RegistrationError::ResponseTooLarge { limit: 16384, .. })
+            ));
+        } else {
+            assert!(
+                matches!(result, Err(RegistrationError::Rejected { status, error_code: None, message })
+                if status.as_u16() == 502 && message.len() <= 4096 && message.ends_with(" [truncated]"))
+            );
+        }
+        assert!(fixture.saved().is_none());
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn registration_body_read_failures_preserve_the_received_http_status() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    for status in [200, 401, 503] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // Drain the request so closing the connection does not discard the
+            // status headers before the client can observe them.
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let length: usize = String::from_utf8(headers)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            stream.read_exact(&mut vec![0; length]).unwrap();
+            // Send the status and one byte of a deliberately incomplete body.
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let mut fixture = Fixture::new();
+        let client = fixture.client(&endpoint, Duration::from_secs(5));
+        let result = client.register(&mut fixture.store).await;
+        server.join().unwrap();
+        match result {
+            Err(RegistrationError::ResponseRead {
+                status: received,
+                source,
+            }) => {
+                assert_eq!(received.as_u16(), status);
+                assert!(source.is_body());
+            }
+            other => panic!("Expected registration body read failure, got {other:?}"),
+        }
+        assert!(fixture.saved().is_none());
+    }
 }

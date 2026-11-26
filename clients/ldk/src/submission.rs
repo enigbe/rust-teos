@@ -11,9 +11,7 @@ use teos_common::{
 
 use crate::{ClientStore, PendingAppointment, StorageError, TowerClient};
 
-const MAX_RESPONSE_BYTES: usize = 16 * 1024;
-const MAX_REJECTION_MESSAGE_BYTES: usize = 4 * 1024;
-const TRUNCATION_MARKER: &str = " [truncated]";
+use crate::tower_response::{read_success, ResponseError, MAX_RESPONSE_BYTES};
 
 /// A tower receipt verified against the exact submitted job, not yet necessarily saved.
 ///
@@ -63,8 +61,8 @@ impl TowerClient {
     /// only covers that payload, not HTLC or unclassified claims in the commitment.
     /// Rejection codes are preserved without choosing a recovery or retry policy;
     /// in particular, an already-triggered appointment is not treated as delivered.
-    /// Response bodies are limited to 16 KiB. Oversized HTTP 200 responses fail;
-    /// rejection messages are limited to 4 KiB and marked when truncated.
+    /// HTTP 200 bodies are limited to 16 KiB; oversized responses fail. Rejection
+    /// bodies and messages are limited to 4 KiB, with messages marked when truncated.
     pub async fn submit_appointment(
         &self,
         store: &mut ClientStore,
@@ -102,36 +100,7 @@ impl TowerClient {
             })
             .send()
             .await?;
-        let status = response.status();
-        // Read failures remain transport errors; decoding a complete body is a
-        // separate response error. Error responses may come from a proxy as well.
-        let (body, truncated) = read_response(response).await?;
-        if status != StatusCode::OK {
-            let details = serde_json::from_slice::<serde_json::Value>(&body).ok();
-            let error_code = details
-                .as_ref()
-                .and_then(|value| value.get("error_code"))
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|code| u32::try_from(code).ok());
-            let message = details
-                .as_ref()
-                .and_then(|value| value.get("error"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-            let message = bounded_message(message, truncated);
-            return Err(SubmissionError::Rejected {
-                status,
-                error_code,
-                message,
-            });
-        }
-        if truncated {
-            return Err(SubmissionError::ResponseTooLarge {
-                status,
-                limit: MAX_RESPONSE_BYTES,
-            });
-        }
+        let body = read_success(response, MAX_RESPONSE_BYTES).await?;
         let response: AddAppointmentResponse =
             serde_json::from_slice(&body).map_err(SubmissionError::InvalidResponse)?;
         if response.locator != job.appointment().locator.to_vec() {
@@ -154,40 +123,6 @@ impl TowerClient {
             receipt,
         })
     }
-}
-
-async fn read_response(
-    mut response: reqwest::Response,
-) -> Result<(Vec<u8>, bool), SubmissionError> {
-    let status = response.status();
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|source| SubmissionError::ResponseRead { status, source })?
-    {
-        let remaining = MAX_RESPONSE_BYTES - body.len();
-        if chunk.len() > remaining {
-            body.extend_from_slice(&chunk[..remaining]);
-            return Ok((body, true));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok((body, false))
-}
-
-fn bounded_message(mut message: String, body_truncated: bool) -> String {
-    if body_truncated || message.len() > MAX_REJECTION_MESSAGE_BYTES {
-        let mut end = message
-            .len()
-            .min(MAX_REJECTION_MESSAGE_BYTES - TRUNCATION_MARKER.len());
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        message.truncate(end);
-        message.push_str(TRUNCATION_MARKER);
-    }
-    message
 }
 
 /// A failure to submit a pending appointment or save the verified tower receipt.
@@ -231,6 +166,24 @@ pub enum SubmissionError {
     /// Loading the saved job or persisting the receipt failed.
     Storage(StorageError),
 }
+impl From<ResponseError> for SubmissionError {
+    fn from(error: ResponseError) -> Self {
+        match error {
+            ResponseError::Read { status, source } => Self::ResponseRead { status, source },
+            ResponseError::TooLarge { status, limit } => Self::ResponseTooLarge { status, limit },
+            ResponseError::Rejected {
+                status,
+                error_code,
+                message,
+            } => Self::Rejected {
+                status,
+                error_code,
+                message,
+            },
+        }
+    }
+}
+
 impl From<reqwest::Error> for SubmissionError {
     fn from(error: reqwest::Error) -> Self {
         Self::Request(error)

@@ -169,3 +169,41 @@ fn a_failed_update_leaves_the_original_configuration_intact() {
         1
     );
 }
+
+#[test]
+fn removal_is_explicit_idempotent_and_leaves_other_towers_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("client.sqlite");
+    let mut store = ClientStore::open(&path).unwrap();
+    let first = config(Duration::from_secs(5));
+    let second = config(Duration::from_secs(10));
+    store.save_tower(&first).unwrap();
+    store.save_tower(&second).unwrap();
+    assert!(store.remove_tower(first.tower_id()).unwrap());
+    assert!(!store.remove_tower(first.tower_id()).unwrap());
+    drop(store);
+    let store = ClientStore::open(&path).unwrap();
+    assert!(store.tower(first.tower_id()).unwrap().is_none());
+    assert_eq!(store.towers().unwrap().len(), 1);
+    assert_config(&store.tower(second.tower_id()).unwrap().unwrap(), &second);
+}
+
+#[test]
+fn a_failed_removal_preserves_the_saved_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("client.sqlite");
+    let mut store = ClientStore::open(&path).unwrap();
+    let tower = config(Duration::from_secs(5));
+    store.save_tower(&tower).unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER fail_tower_removal AFTER DELETE ON tower_registry
+        BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .unwrap();
+    assert!(matches!(
+        store.remove_tower(tower.tower_id()),
+        Err(StorageError::Sqlite(_))
+    ));
+    assert_config(&store.tower(tower.tower_id()).unwrap().unwrap(), &tower);
+}

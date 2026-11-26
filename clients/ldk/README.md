@@ -83,6 +83,38 @@ required tower still needs a matching receipt when replaying completed delivery.
 The fee rate is fixed for each worker; an already prepared commitment keeps its
 original payload even if a later worker uses a different fee rate.
 
+## Registration and subscription operations
+
+`TowerClient::register(&mut store)` explicitly registers or renews the persisted
+identity. It verifies and saves the signed receipt before returning success, and
+never retries automatically. `RegistrationError::Rejected` preserves the HTTP
+status, optional tower error code, and a bounded message. A malformed HTTP 200
+reply returns `InvalidResponse`; a body-transfer failure returns `ResponseRead`
+with the received status. HTTP 200 bodies are limited to 16 KiB; rejection bodies
+and messages to 4 KiB. These methods share response handling with appointment
+submission.
+
+`TowerClient::subscription_info(&identity)` signs the protocol's subscription
+query with an identity obtained from `ClientStore::load_or_create_identity`.
+The request does not borrow storage, register, renew, retry, or rearm delivery.
+`SubscriptionInfo` reports remaining slots, expiry height, and typed appointment
+locators. The protocol supplies no subscription start height in this response.
+
+The report is unsigned and remains separate from signed registration and
+appointment receipts. It does not establish delivery or authorize LDK
+acknowledgment, and the query never overwrites stored evidence. Bodies are
+limited to 1 MiB by default, covering about 30,000 locators. Use
+`subscription_info_with_limit(&identity, limit)` with a `NonZeroUsize` byte limit
+for larger successful reports. Rejection bodies and messages remain capped at
+4 KiB independently of that limit. Allow about 35 JSON bytes per expected locator
+plus headroom; the remaining slot count in a registration receipt cannot size
+this list.
+Oversized reports fail explicitly instead of returning a partial list. Malformed
+locators also fail the query.
+Subscription errors preserve tower rejection details and distinguish transport,
+body-transfer, and decoding failures. The application decides whether to renew
+or investigate a rejection; subscription queries do not choose a recovery policy.
+
 ## Saved towers
 
 `ClientStore::save_tower(&config)` persists a validated `TowerConfig`, keyed by
@@ -104,6 +136,18 @@ Loading validates the public key, URL, and nonzero timeout again; invalid select
 entries return an error instead of being silently omitted from the required tower
 set. Reopening with `UseSavedReceipts` does not register again, even if an endpoint
 or timeout changed. Choose renewal explicitly when it is needed.
+
+`ClientStore::remove_tower(id)` removes only the saved connection settings and
+returns whether an entry was removed. Repeated removal returns `false`. It keeps
+the client identity, registration receipts, pending appointments, coverage
+history, and delivery evidence. It neither contacts the tower nor cancels the
+appointments already stored there.
+
+Removal does not change a running worker or cancel its in-flight requests. To
+retire a tower from delivery, explicitly change `Settings::required_towers` and
+rebuild the worker. Keeping a removed ID selected makes startup fail, rather than
+silently weakening the required-tower set. Removal does not erase receipts needed
+for historical verification or replay.
 
 ## Database versions and migrations
 
